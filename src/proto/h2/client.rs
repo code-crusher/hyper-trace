@@ -14,7 +14,7 @@ use futures_channel::{mpsc, oneshot};
 use futures_core::{ready, FusedFuture, FusedStream, Stream};
 use h2::client::{Builder, Connection, SendRequest};
 use h2::SendStream;
-use http::{Method, StatusCode};
+use http::Method;
 use pin_project_lite::pin_project;
 
 use super::ping::{Ponger, Recorder};
@@ -624,7 +624,8 @@ where
                 ping.record_non_data();
 
                 let content_length = headers::content_length_parse_all(res.headers());
-                if let (Some(mut send_stream), StatusCode::OK) = (send_stream, res.status()) {
+                // RFC 9110 9.3.6: any 2xx response to a CONNECT establishes the tunnel.
+                if let (Some(mut send_stream), true) = (send_stream, res.status().is_success()) {
                     if content_length.map_or(false, |len| len != 0) {
                         warn!("h2 connect response with non-zero body not supported");
 

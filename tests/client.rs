@@ -2972,6 +2972,60 @@ mod conn {
     }
 
     #[tokio::test]
+    async fn h2_connect_non_200_2xx() {
+        // RFC 9110 9.3.6: any 2xx response to a CONNECT establishes a tunnel,
+        // not just `200 OK`.
+        let (client_io, server_io, _) = setup_duplex_test_server();
+
+        tokio::spawn(async move {
+            let sock = server_io;
+            let mut h2 = h2::server::handshake(sock).await.unwrap();
+
+            let (req, mut respond) = h2.accept().await.unwrap().unwrap();
+            tokio::spawn(async move {
+                poll_fn(|cx| h2.poll_closed(cx)).await.unwrap();
+            });
+            assert_eq!(req.method(), Method::CONNECT);
+
+            let mut body = req.into_body();
+
+            let res = Response::builder().status(201).body(()).unwrap();
+            let mut send_stream = respond.send_response(res, false).unwrap();
+            send_stream.send_data("Bread?".into(), true).unwrap();
+
+            let bytes = body.data().await.unwrap().unwrap();
+            assert_eq!(&bytes[..], b"Baguette!");
+            let _ = body.flow_control().release_capacity(bytes.len());
+        });
+
+        let io = TokioIo::new(client_io);
+        let (mut client, conn) = conn::http2::Builder::new(TokioExecutor)
+            .handshake(io)
+            .await
+            .expect("http handshake");
+
+        tokio::spawn(async move {
+            conn.await.expect("client conn shouldn't error");
+        });
+
+        let req = Request::connect("localhost")
+            .body(Empty::<Bytes>::new())
+            .unwrap();
+        let res = client.send_request(req).await.expect("send_request");
+        assert_eq!(res.status(), StatusCode::CREATED);
+        assert!(res.extensions().get::<OnUpgrade>().is_some());
+
+        let mut upgraded = TokioIo::new(hyper::upgrade::on(res).await.unwrap());
+
+        let mut vec = vec![];
+        upgraded.read_to_end(&mut vec).await.unwrap();
+        assert_eq!(s(&vec), "Bread?");
+
+        upgraded.write_all(b"Baguette!").await.unwrap();
+        upgraded.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
     async fn h2_connect_rejected() {
         let (client_io, server_io, _) = setup_duplex_test_server();
         let (done_tx, done_rx) = oneshot::channel();
