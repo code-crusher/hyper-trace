@@ -349,3 +349,8 @@ required-features = ["full"]
 name = "h1_ready_in_flight"
 path = "tests/h1_ready_in_flight.rs"
 required-features = ["full"]
+
+[[test]]
+name = "alloc_probe"
+path = "tests/alloc_probe.rs"
+required-features = ["full"]
