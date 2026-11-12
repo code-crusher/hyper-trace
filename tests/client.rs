@@ -3521,6 +3521,299 @@ mod conn {
         let _ = stream_a_done_tx.send(());
         drop(upgraded);
     }
+
+    /// Read from a blocking socket until a full HTTP/1 head has arrived,
+    /// returning everything read so far. Any request body sent eagerly would
+    /// be included in the returned string.
+    fn read_head(sock: &mut std::net::TcpStream) -> String {
+        let mut buf = Vec::new();
+        let mut chunk = [0; 1024];
+        loop {
+            let n = sock.read(&mut chunk).expect("read head");
+            assert!(n > 0, "connection closed before the head was complete");
+            buf.extend_from_slice(&chunk[..n]);
+            if buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                return String::from_utf8(buf).expect("head is utf8");
+            }
+        }
+    }
+
+    fn assert_no_data(sock: &mut std::net::TcpStream, wait: Duration, msg: &str) {
+        sock.set_read_timeout(Some(wait)).unwrap();
+        let mut buf = [0; 64];
+        match sock.read(&mut buf) {
+            // The client closed its write side without sending the body.
+            Ok(0) => (),
+            Err(ref e)
+                if matches!(
+                    e.kind(),
+                    io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                ) => {}
+            Ok(n) => panic!("{msg}: {:?}", &buf[..n]),
+            Err(e) => panic!("unexpected read error: {e}"),
+        }
+    }
+
+    fn read_body(sock: &mut std::net::TcpStream, len: usize) -> Vec<u8> {
+        let mut body = Vec::new();
+        let mut buf = [0; 64];
+        while body.len() < len {
+            let n = sock.read(&mut buf).expect("read body");
+            assert!(n > 0, "connection closed before the body was complete");
+            body.extend_from_slice(&buf[..n]);
+        }
+        body
+    }
+
+    #[tokio::test]
+    async fn expect_continue_waits_for_100_before_body() {
+        let (server, addr) = setup_std_test_server();
+
+        let server = thread::spawn(move || {
+            let mut sock = server.accept().unwrap().0;
+            sock.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            sock.set_write_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+
+            let head = read_head(&mut sock);
+            assert!(head.starts_with("POST /a HTTP/1.1\r\n"), "head: {head:?}");
+            assert!(head.contains("expect: 100-continue"), "head: {head:?}");
+            assert!(
+                head.ends_with("\r\n\r\n"),
+                "body was sent before 100 Continue: {head:?}"
+            );
+            assert_no_data(
+                &mut sock,
+                Duration::from_millis(500),
+                "body was sent before 100 Continue",
+            );
+
+            sock.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            sock.write_all(b"HTTP/1.1 100 Continue\r\n\r\n").unwrap();
+
+            assert_eq!(read_body(&mut sock, 5), b"hello");
+
+            sock.write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\n\r\n")
+                .unwrap();
+        });
+
+        let tcp = tcp_connect(&addr).await.unwrap();
+
+        let (mut client, conn) = conn::http1::handshake(tcp).await.expect("handshake");
+
+        let conn_task = tokio::spawn(async move {
+            let _ = conn.await;
+        });
+
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri("/a")
+            .header(hyper::header::EXPECT, "100-continue")
+            .body(Full::new(Bytes::from("hello")))
+            .unwrap();
+
+        let res = client.send_request(req).await.expect("send_request");
+        assert_eq!(res.status(), StatusCode::OK);
+
+        server.join().expect("server thread panicked");
+        tokio::time::timeout(Duration::from_secs(5), conn_task)
+            .await
+            .expect("connection did not finish")
+            .expect("connection task panicked");
+    }
+
+    #[tokio::test]
+    async fn expect_continue_final_response_skips_body() {
+        let (server, addr) = setup_std_test_server();
+
+        let server = thread::spawn(move || {
+            let mut sock = server.accept().unwrap().0;
+            sock.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            sock.set_write_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+
+            let head = read_head(&mut sock);
+            assert!(head.contains("expect: 100-continue"), "head: {head:?}");
+            assert!(
+                head.ends_with("\r\n\r\n"),
+                "body was sent before the response: {head:?}"
+            );
+
+            sock.write_all(b"HTTP/1.1 417 Expectation Failed\r\ncontent-length: 0\r\n\r\n")
+                .unwrap();
+
+            // The client must not send the withheld body once the final
+            // response has arrived.
+            assert_no_data(
+                &mut sock,
+                Duration::from_millis(500),
+                "body was sent after a final response",
+            );
+        });
+
+        let tcp = tcp_connect(&addr).await.unwrap();
+
+        let (mut client, conn) = conn::http1::handshake(tcp).await.expect("handshake");
+
+        let conn_task = tokio::spawn(async move {
+            let _ = conn.await;
+        });
+
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri("/a")
+            .header(hyper::header::EXPECT, "100-continue")
+            .body(Full::new(Bytes::from("hello")))
+            .unwrap();
+
+        let res = client.send_request(req).await.expect("send_request");
+        assert_eq!(res.status(), StatusCode::EXPECTATION_FAILED);
+
+        server.join().expect("server thread panicked");
+        tokio::time::timeout(Duration::from_secs(5), conn_task)
+            .await
+            .expect("connection did not finish")
+            .expect("connection task panicked");
+    }
+
+    #[tokio::test]
+    async fn expect_continue_and_final_response_in_one_read() {
+        let (server, addr) = setup_std_test_server();
+
+        let server = thread::spawn(move || {
+            let mut sock = server.accept().unwrap().0;
+            sock.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            sock.set_write_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+
+            let head = read_head(&mut sock);
+            assert!(head.contains("expect: 100-continue"), "head: {head:?}");
+
+            // Both interim and final response in a single write, so they are
+            // likely parsed together.
+            sock.write_all(
+                b"HTTP/1.1 100 Continue\r\n\r\n\
+                  HTTP/1.1 200 OK\r\ncontent-length: 0\r\n\r\n",
+            )
+            .unwrap();
+
+            // The body is not needed once the final response is in.
+            assert_no_data(&mut sock, Duration::from_millis(500), "body was sent");
+        });
+
+        let tcp = tcp_connect(&addr).await.unwrap();
+
+        let (mut client, conn) = conn::http1::handshake(tcp).await.expect("handshake");
+
+        let conn_task = tokio::spawn(async move {
+            let _ = conn.await;
+        });
+
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri("/a")
+            .header(hyper::header::EXPECT, "100-continue")
+            .body(Full::new(Bytes::from("hello")))
+            .unwrap();
+
+        let res = client.send_request(req).await.expect("send_request");
+        assert_eq!(res.status(), StatusCode::OK);
+
+        server.join().expect("server thread panicked");
+        tokio::time::timeout(Duration::from_secs(5), conn_task)
+            .await
+            .expect("connection did not finish")
+            .expect("connection task panicked");
+    }
+
+    #[tokio::test]
+    async fn expect_continue_ignored_without_body() {
+        let io = tokio_test::io::Builder::new()
+            .write(b"POST /a HTTP/1.1\r\nexpect: 100-continue\r\n\r\n")
+            .read(b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\n\r\n")
+            .build();
+
+        let (mut client, conn) = conn::http1::handshake(TokioIo::new(io))
+            .await
+            .expect("handshake");
+
+        tokio::spawn(async move {
+            let _ = conn.await;
+        });
+
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri("/a")
+            .header(hyper::header::EXPECT, "100-continue")
+            .body(Empty::<Bytes>::new())
+            .unwrap();
+
+        let res = client.send_request(req).await.expect("send_request");
+        assert_eq!(res.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn expect_continue_sends_body_after_timeout() {
+        let (server, addr) = setup_std_test_server();
+
+        let server = thread::spawn(move || {
+            let mut sock = server.accept().unwrap().0;
+            sock.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            sock.set_write_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+
+            let head = read_head(&mut sock);
+            assert!(head.contains("expect: 100-continue"), "head: {head:?}");
+            assert!(
+                head.ends_with("\r\n\r\n"),
+                "body was sent before the timeout: {head:?}"
+            );
+
+            // Never send `100 Continue`; the client should give up waiting
+            // and send the body on its own. First make sure it is actually
+            // waiting, and did not send the body eagerly.
+            assert_no_data(
+                &mut sock,
+                Duration::from_millis(20),
+                "body was sent before the timeout",
+            );
+
+            sock.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            assert_eq!(read_body(&mut sock, 5), b"hello");
+
+            sock.write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\n\r\n")
+                .unwrap();
+        });
+
+        let tcp = tcp_connect(&addr).await.unwrap();
+
+        let (mut client, conn) = conn::http1::Builder::new()
+            .timer(TokioTimer::new())
+            .expect_100_timeout(Duration::from_millis(100))
+            .handshake::<_, Full<Bytes>>(tcp)
+            .await
+            .expect("handshake");
+
+        let conn_task = tokio::spawn(async move {
+            let _ = conn.await;
+        });
+
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri("/a")
+            .header(hyper::header::EXPECT, "100-continue")
+            .body(Full::new(Bytes::from("hello")))
+            .unwrap();
+
+        let res = client.send_request(req).await.expect("send_request");
+        assert_eq!(res.status(), StatusCode::OK);
+
+        server.join().expect("server thread panicked");
+        tokio::time::timeout(Duration::from_secs(5), conn_task)
+            .await
+            .expect("connection did not finish")
+            .expect("connection task panicked");
+    }
 }
 
 trait FutureHyperExt: TryFuture {

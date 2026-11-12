@@ -42,6 +42,15 @@ fn connection_has(value: &HeaderValue, needle: &str) -> bool {
     false
 }
 
+// Returns true if the message carries an `Expect: 100-continue` header. The
+// expectation token is compared case-insensitively, per RFC 9110 Section 10.1.1.
+#[cfg(all(feature = "http1", feature = "client"))]
+pub(super) fn expect_continue(headers: &http::HeaderMap) -> bool {
+    headers.get(http::header::EXPECT).map_or(false, |value| {
+        value.as_bytes().eq_ignore_ascii_case(b"100-continue")
+    })
+}
+
 #[cfg(feature = "http1")]
 pub(super) fn te_is_trailers(headers: &http::HeaderMap) -> bool {
     header_value_list_has(headers.get_all(http::header::TE).into_iter(), "trailers")

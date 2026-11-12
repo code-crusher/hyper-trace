@@ -1,11 +1,11 @@
 use std::fmt;
-#[cfg(feature = "server")]
+#[cfg(any(feature = "client", feature = "server"))]
 use std::future::Future;
 use std::io;
 use std::marker::{PhantomData, Unpin};
 use std::pin::Pin;
 use std::task::{Context, Poll};
-#[cfg(feature = "server")]
+#[cfg(any(feature = "client", feature = "server"))]
 use std::time::Duration;
 
 use crate::rt::{Read, Write};
@@ -19,11 +19,11 @@ use httparse::ParserConfig;
 use super::io::Buffered;
 use super::{Decoder, Encode, EncodedBuf, Encoder, Http1Transaction, ParseContext, Wants};
 use crate::body::DecodedLength;
-#[cfg(feature = "server")]
+#[cfg(any(feature = "client", feature = "server"))]
 use crate::common::time::Time;
 use crate::headers;
 use crate::proto::{BodyLength, MessageHead};
-#[cfg(feature = "server")]
+#[cfg(any(feature = "client", feature = "server"))]
 use crate::rt::Sleep;
 
 const H2_PREFACE: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
@@ -67,7 +67,7 @@ where
                 h1_header_read_timeout_running: false,
                 #[cfg(feature = "server")]
                 date_header: true,
-                #[cfg(feature = "server")]
+                #[cfg(any(feature = "client", feature = "server"))]
                 timer: Time::Empty,
                 preserve_header_case: false,
                 #[cfg(feature = "ffi")]
@@ -76,6 +76,14 @@ where
                 h09_responses: false,
                 #[cfg(feature = "client")]
                 on_informational: None,
+                #[cfg(feature = "client")]
+                awaiting_continue: false,
+                #[cfg(feature = "client")]
+                h1_continue_timeout: None,
+                #[cfg(feature = "client")]
+                h1_continue_timeout_fut: None,
+                #[cfg(feature = "client")]
+                h1_continue_timeout_running: false,
                 notify_read: false,
                 reading: Reading::Init,
                 writing: Writing::Init,
@@ -89,7 +97,7 @@ where
         }
     }
 
-    #[cfg(feature = "server")]
+    #[cfg(any(feature = "client", feature = "server"))]
     pub(crate) fn set_timer(&mut self, timer: Time) {
         self.state.timer = timer;
     }
@@ -149,6 +157,13 @@ where
     #[cfg(feature = "server")]
     pub(crate) fn set_http1_header_read_timeout(&mut self, val: Duration) {
         self.state.h1_header_read_timeout = Some(val);
+    }
+
+    /// Set how long the client waits for a `100 Continue` before sending the
+    /// request body anyway.
+    #[cfg(feature = "client")]
+    pub(crate) fn set_http1_continue_timeout(&mut self, val: Duration) {
+        self.state.h1_continue_timeout = Some(val);
     }
 
     #[cfg(feature = "server")]
@@ -239,7 +254,10 @@ where
             }
         }
 
-        let msg = match self.io.parse::<T>(
+        #[cfg(feature = "client")]
+        let mut seen_continue = false;
+
+        let parse_result = self.io.parse::<T>(
             cx,
             ParseContext {
                 cached_headers: &mut self.state.cached_headers,
@@ -253,8 +271,29 @@ where
                 h09_responses: self.state.h09_responses,
                 #[cfg(feature = "client")]
                 on_informational: &mut self.state.on_informational,
+                #[cfg(feature = "client")]
+                seen_continue: &mut seen_continue,
             },
-        ) {
+        );
+
+        // While the request body is withheld, `parse` only yields a message
+        // for a final response; 1xx responses are consumed inside it. So a
+        // final response here means the server answered without waiting for
+        // the body: never send it, and close the write side, since HTTP/1
+        // cannot frame a request whose body was skipped. This also covers a
+        // `100 Continue` that was followed by the final response in the same
+        // read. Otherwise, a `100 Continue` releases the body.
+        #[cfg(feature = "client")]
+        if self.state.awaiting_continue {
+            if let Poll::Ready(Ok(_)) = &parse_result {
+                trace!("final response received while awaiting 100 Continue");
+                self.abandon_continue();
+            } else if seen_continue {
+                self.release_continue();
+            }
+        }
+
+        let msg = match parse_result {
             Poll::Ready(Ok(msg)) => msg,
             Poll::Ready(Err(e)) => return self.on_read_head_error(e),
             Poll::Pending => {
@@ -585,7 +624,16 @@ where
 
     pub(crate) fn can_write_body(&self) -> bool {
         match self.state.writing {
-            Writing::Body(..) => true,
+            Writing::Body(..) => {
+                #[cfg(feature = "client")]
+                {
+                    !self.state.awaiting_continue
+                }
+                #[cfg(not(feature = "client"))]
+                {
+                    true
+                }
+            }
             Writing::Init | Writing::KeepAlive | Writing::Closed => false,
         }
     }
@@ -599,15 +647,93 @@ where
         self.io.has_buffered_write()
     }
 
+    /// Whether the client has written a request head with `Expect: 100-continue`
+    /// and is waiting for the server's interim response before sending the body.
+    #[cfg(feature = "client")]
+    pub(crate) fn is_awaiting_continue(&self) -> bool {
+        self.state.awaiting_continue
+    }
+
+    /// Stop withholding the request body, sending it on the next write.
+    #[cfg(feature = "client")]
+    fn release_continue(&mut self) {
+        self.state.awaiting_continue = false;
+
+        // Clear the timer so a reused connection re-arms instead of firing a
+        // stale deadline.
+        self.state.h1_continue_timeout_running = false;
+        self.state.h1_continue_timeout_fut = None;
+    }
+
+    /// Drop the withheld request body without sending it, because the server
+    /// answered with a final response. HTTP/1 cannot reuse a connection whose
+    /// request body was never written, so the write side is closed.
+    #[cfg(feature = "client")]
+    fn abandon_continue(&mut self) {
+        self.release_continue();
+        self.state.close_write();
+    }
+
+    /// Poll the deadline for a withheld request body. Returns `Ready` once the
+    /// body has been released (by the timeout), and `Pending` while still
+    /// waiting or when no timeout is configured.
+    #[cfg(feature = "client")]
+    pub(crate) fn poll_continue_timeout(&mut self, cx: &mut Context<'_>) -> Poll<()> {
+        if !self.state.awaiting_continue {
+            return Poll::Pending;
+        }
+
+        let timeout = match self.state.h1_continue_timeout {
+            Some(timeout) => timeout,
+            None => return Poll::Pending,
+        };
+
+        if !self.state.h1_continue_timeout_running {
+            let deadline = self.state.timer.now() + timeout;
+            self.state.h1_continue_timeout_running = true;
+            self.state.h1_continue_timeout_fut = Some(self.state.timer.sleep_until(deadline));
+        }
+
+        if let Some(fut) = &mut self.state.h1_continue_timeout_fut {
+            if Pin::new(fut).poll(cx).is_ready() {
+                trace!("expect-continue timeout elapsed, sending body anyway");
+                self.release_continue();
+                return Poll::Ready(());
+            }
+        }
+
+        Poll::Pending
+    }
+
     pub(crate) fn write_head(&mut self, head: MessageHead<T::Outgoing>, body: Option<BodyLength>) {
+        // A client request that asks to wait for `100 Continue` must not have
+        // its body written until the interim response (or a timeout) arrives.
+        #[cfg(feature = "client")]
+        let expect_continue = !T::should_read_first()
+            && head.version > Version::HTTP_10
+            && headers::expect_continue(&head.headers);
+
+        #[cfg(feature = "client")]
+        {
+            self.state.awaiting_continue = false;
+        }
+
         if let Some(encoder) = self.encode_head(head, body) {
-            self.state.writing = if !encoder.is_eof() {
+            let is_eof = encoder.is_eof();
+            let is_last = encoder.is_last();
+            self.state.writing = if !is_eof {
                 Writing::Body(encoder)
-            } else if encoder.is_last() {
+            } else if is_last {
                 Writing::Closed
             } else {
                 Writing::KeepAlive
             };
+
+            // Only withhold a body that will actually be written.
+            #[cfg(feature = "client")]
+            {
+                self.state.awaiting_continue = expect_continue && !is_eof;
+            }
         }
     }
 
@@ -961,7 +1087,7 @@ struct State {
     h1_header_read_timeout_running: bool,
     #[cfg(feature = "server")]
     date_header: bool,
-    #[cfg(feature = "server")]
+    #[cfg(any(feature = "client", feature = "server"))]
     timer: Time,
     preserve_header_case: bool,
     #[cfg(feature = "ffi")]
@@ -973,6 +1099,17 @@ struct State {
     /// received.
     #[cfg(feature = "client")]
     on_informational: Option<crate::ext::OnInformational>,
+    /// Set while the client withholds a request body until it sees
+    /// `100 Continue` (or the timeout elapses).
+    #[cfg(feature = "client")]
+    awaiting_continue: bool,
+    /// How long to wait for a `100 Continue` before sending the request body.
+    #[cfg(feature = "client")]
+    h1_continue_timeout: Option<Duration>,
+    #[cfg(feature = "client")]
+    h1_continue_timeout_fut: Option<Pin<Box<dyn Sleep>>>,
+    #[cfg(feature = "client")]
+    h1_continue_timeout_running: bool,
     /// Set to true when the Dispatcher should poll read operations
     /// again. See the `maybe_notify` method for more.
     notify_read: bool,

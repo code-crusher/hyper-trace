@@ -1,6 +1,6 @@
-#[cfg(any(
-    all(any(feature = "client", feature = "server"), feature = "http2"),
-    all(feature = "server", feature = "http1"),
+#[cfg(all(
+    any(feature = "client", feature = "server"),
+    any(feature = "http1", feature = "http2")
 ))]
 use std::time::Duration;
 use std::{fmt, sync::Arc};
@@ -16,7 +16,7 @@ pub(crate) enum Time {
     Empty,
 }
 
-#[cfg(all(feature = "server", feature = "http1"))]
+#[cfg(all(any(feature = "client", feature = "server"), feature = "http1"))]
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum Dur {
     Default(Option<Duration>),
@@ -41,7 +41,7 @@ impl Time {
         }
     }
 
-    #[cfg(all(feature = "server", feature = "http1"))]
+    #[cfg(all(any(feature = "client", feature = "server"), feature = "http1"))]
     pub(crate) fn sleep_until(&self, deadline: Instant) -> Pin<Box<dyn Sleep>> {
         match &self {
             #[allow(clippy::panic)]
@@ -59,6 +59,7 @@ impl Time {
         }
     }
 
+    #[cfg(any(all(feature = "server", feature = "http1"), feature = "http2"))]
     pub(crate) fn reset(&self, sleep: &mut Pin<Box<dyn Sleep>>, new_deadline: Instant) {
         match &self {
             #[allow(clippy::panic)]
@@ -69,7 +70,7 @@ impl Time {
         }
     }
 
-    #[cfg(all(feature = "server", feature = "http1"))]
+    #[cfg(all(any(feature = "client", feature = "server"), feature = "http1"))]
     pub(crate) fn check(&self, dur: Dur, name: &'static str) -> Option<Duration> {
         match dur {
             Dur::Default(Some(dur)) => match self {

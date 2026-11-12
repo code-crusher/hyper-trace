@@ -4,13 +4,17 @@ use std::error::Error as StdError;
 use std::fmt;
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::Arc;
 use std::task::{Context, Poll};
+use std::time::Duration;
 
-use crate::rt::{Read, Write};
+use crate::rt::{Read, Timer, Write};
 use bytes::Bytes;
 use futures_core::ready;
 use http::{Request, Response};
 use httparse::ParserConfig;
+
+use crate::common::time::{Dur, Time};
 
 use super::super::dispatch::{self, TrySendError};
 use crate::body::{Body, Incoming as IncomingBody};
@@ -128,11 +132,13 @@ where
 pub struct Builder {
     h09_responses: bool,
     h1_parser_config: ParserConfig,
+    timer: Time,
     h1_writev: Option<bool>,
     h1_title_case_headers: bool,
     h1_preserve_header_case: bool,
     h1_max_headers: Option<usize>,
     h1_max_header_size: Option<usize>,
+    h1_continue_timeout: Dur,
     #[cfg(feature = "ffi")]
     h1_preserve_header_order: bool,
     h1_read_buf_exact_size: Option<usize>,
@@ -351,10 +357,12 @@ impl Builder {
             h1_writev: None,
             h1_read_buf_exact_size: None,
             h1_parser_config: ParserConfig::default(),
+            timer: Time::Empty,
             h1_title_case_headers: false,
             h1_preserve_header_case: false,
             h1_max_headers: None,
             h1_max_header_size: None,
+            h1_continue_timeout: Dur::Default(Some(Duration::from_secs(30))),
             #[cfg(feature = "ffi")]
             h1_preserve_header_order: false,
             h1_max_buf_size: None,
@@ -518,6 +526,46 @@ impl Builder {
         self
     }
 
+    /// Provide a timer for the client to use when waiting for a
+    /// `100 Continue` response.
+    ///
+    /// See [`Builder::expect_100_timeout`].
+    pub fn timer<M>(&mut self, timer: M) -> &mut Self
+    where
+        M: Timer + Send + Sync + 'static,
+    {
+        self.timer = Time::Timer(Arc::new(timer));
+        self
+    }
+
+    /// Set how long to wait for a `100 Continue` response before sending the
+    /// request body anyway.
+    ///
+    /// When a request includes an `Expect: 100-continue` header and a body,
+    /// the client writes only the request head first. It waits for the server
+    /// to respond with `100 Continue`, and only then writes the body. If the
+    /// server responds with a final response instead, the body is never sent
+    /// and the connection is closed, since HTTP/1 cannot frame a request
+    /// whose body was skipped.
+    ///
+    /// If no response arrives within this timeout, the body is sent anyway.
+    /// This requires a [`Timer`] to be set with [`Builder::timer`]; without
+    /// one, the default timeout is ignored and the client waits for the
+    /// server indefinitely. Passing `None` explicitly does the same.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `expect_100_timeout` is configured with a duration but no
+    /// [`Timer`] was set.
+    ///
+    /// # Default
+    ///
+    /// The default is 30 seconds.
+    pub fn expect_100_timeout(&mut self, timeout: impl Into<Option<Duration>>) -> &mut Self {
+        self.h1_continue_timeout = Dur::Configured(timeout.into());
+        self
+    }
+
     /// Set whether to support preserving original header order.
     ///
     /// Currently, this will record the order in which headers are received, and store this
@@ -589,6 +637,13 @@ impl Builder {
             let (tx, rx) = dispatch::channel();
             let mut conn = proto::Conn::new(io);
             conn.set_h1_parser_config(opts.h1_parser_config);
+            conn.set_timer(opts.timer.clone());
+            if let Some(dur) = opts
+                .timer
+                .check(opts.h1_continue_timeout, "expect_100_timeout")
+            {
+                conn.set_http1_continue_timeout(dur);
+            }
             if let Some(writev) = opts.h1_writev {
                 if writev {
                     conn.set_write_strategy_queue();
