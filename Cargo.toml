@@ -351,6 +351,6 @@ path = "tests/h1_ready_in_flight.rs"
 required-features = ["full"]
 
 [[test]]
-name = "alloc_probe"
-path = "tests/alloc_probe.rs"
+name = "h1_dispatch_memory"
+path = "tests/h1_dispatch_memory.rs"
 required-features = ["full"]

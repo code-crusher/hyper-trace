@@ -73,9 +73,8 @@ async fn h1_connection_is_not_ready_while_a_request_is_in_flight() {
     let _response = sender.send_request(Request::new(Empty::new()));
     assert!(!sender.is_ready());
 
-    // Out of coop budget, the queue reports Pending with the request in it, so
-    // the connection signals ready again. A connection task preempted between
-    // finding its queue empty and signaling leaves the same stale signal.
+    // Out of coop budget, polling the connection once more must not leave it
+    // reporting ready while the request is still queued.
     poll_fn(|cx| {
         while let Poll::Ready(restore) = tokio::task::coop::poll_proceed(cx) {
             restore.made_progress();

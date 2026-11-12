@@ -1,14 +1,19 @@
+use std::collections::VecDeque;
+use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 #[cfg(feature = "http2")]
 use std::{future::Future, pin::Pin};
 
+use atomic_waker::AtomicWaker;
 #[cfg(feature = "http2")]
 use http::{Request, Response};
 #[cfg(feature = "http2")]
 use http_body::Body;
 #[cfg(feature = "http2")]
 use pin_project_lite::pin_project;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::oneshot;
+
+use crate::common::lock::LockResultExt;
 
 #[cfg(feature = "http2")]
 use crate::{body::Incoming, proto::h2::client::ResponseFutMap};
@@ -29,15 +34,23 @@ pub struct TrySendError<T> {
 }
 
 pub(crate) fn channel<T, U>() -> (Sender<T, U>, Receiver<T, U>) {
-    let (tx, rx) = mpsc::unbounded_channel();
+    let shared = Arc::new(Shared {
+        state: Mutex::new(State {
+            first: None,
+            rest: VecDeque::new(),
+            senders: 1,
+            receiver_open: true,
+        }),
+        recv_waker: AtomicWaker::new(),
+    });
     let (giver, taker) = want::new();
     let tx = Sender {
         #[cfg(feature = "http1")]
         buffered_once: false,
         giver,
-        inner: tx,
+        inner: SenderInner::new(shared.clone()),
     };
-    let rx = Receiver { inner: rx, taker };
+    let rx = Receiver { shared, taker };
     (tx, rx)
 }
 
@@ -57,7 +70,7 @@ pub(crate) struct Sender<T, U> {
     /// for more.
     giver: want::Giver,
     /// Actually bounded by the Giver, plus `buffered_once`.
-    inner: mpsc::UnboundedSender<Envelope<T, U>>,
+    inner: SenderInner<T, U>,
 }
 
 /// An unbounded version.
@@ -66,9 +79,9 @@ pub(crate) struct Sender<T, U> {
 /// has been dropped. However, this version can be cloned.
 #[cfg(feature = "http2")]
 pub(crate) struct UnboundedSender<T, U> {
-    /// Only used for `is_closed`, since `mpsc::UnboundedSender` cannot be checked.
+    /// Only used for `is_closed`, since the queue cannot be checked.
     giver: want::SharedGiver,
-    inner: mpsc::UnboundedSender<Envelope<T, U>>,
+    inner: SenderInner<T, U>,
 }
 
 impl<T, U> Sender<T, U> {
@@ -110,9 +123,9 @@ impl<T, U> Sender<T, U> {
         }
         let (tx, rx) = oneshot::channel();
         self.inner
-            .send(Envelope(Some((val, Callback::Retry(Some(tx))))))
+            .try_push(Envelope(Some((val, Callback::Retry(Some(tx))))))
             .map(move |()| rx)
-            .map_err(|mut e| (e.0).0.take().expect("envelope not dropped").0)
+            .map_err(|mut e| e.0.take().expect("envelope not dropped").0)
     }
 
     #[cfg(feature = "http1")]
@@ -122,9 +135,9 @@ impl<T, U> Sender<T, U> {
         }
         let (tx, rx) = oneshot::channel();
         self.inner
-            .send(Envelope(Some((val, Callback::NoRetry(Some(tx))))))
+            .try_push(Envelope(Some((val, Callback::NoRetry(Some(tx))))))
             .map(move |()| rx)
-            .map_err(|mut e| (e.0).0.take().expect("envelope not dropped").0)
+            .map_err(|mut e| e.0.take().expect("envelope not dropped").0)
     }
 
     #[cfg(feature = "http2")]
@@ -149,17 +162,17 @@ impl<T, U> UnboundedSender<T, U> {
     pub(crate) fn try_send(&mut self, val: T) -> Result<RetryPromise<T, U>, T> {
         let (tx, rx) = oneshot::channel();
         self.inner
-            .send(Envelope(Some((val, Callback::Retry(Some(tx))))))
+            .try_push(Envelope(Some((val, Callback::Retry(Some(tx))))))
             .map(move |()| rx)
-            .map_err(|mut e| (e.0).0.take().expect("envelope not dropped").0)
+            .map_err(|mut e| e.0.take().expect("envelope not dropped").0)
     }
 
     pub(crate) fn send(&mut self, val: T) -> Result<Promise<U>, T> {
         let (tx, rx) = oneshot::channel();
         self.inner
-            .send(Envelope(Some((val, Callback::NoRetry(Some(tx))))))
+            .try_push(Envelope(Some((val, Callback::NoRetry(Some(tx))))))
             .map(move |()| rx)
-            .map_err(|mut e| (e.0).0.take().expect("envelope not dropped").0)
+            .map_err(|mut e| e.0.take().expect("envelope not dropped").0)
     }
 }
 
@@ -173,59 +186,169 @@ impl<T, U> Clone for UnboundedSender<T, U> {
     }
 }
 
+/// The sending half of the shared queue.
+///
+/// A separate type so that dropping it can decrement the sender count even
+/// when the queue is moved from a [`Sender`] to an [`UnboundedSender`].
+struct SenderInner<T, U> {
+    shared: Arc<Shared<T, U>>,
+}
+
+impl<T, U> SenderInner<T, U> {
+    fn new(shared: Arc<Shared<T, U>>) -> Self {
+        SenderInner { shared }
+    }
+
+    fn try_push(&self, env: Envelope<T, U>) -> Result<(), Envelope<T, U>> {
+        let mut state = self.shared.state.lock().panic_if_poisoned();
+        if !state.receiver_open {
+            return Err(env);
+        }
+        state.push(env);
+        drop(state);
+        self.shared.recv_waker.wake();
+        Ok(())
+    }
+}
+
+impl<T, U> Clone for SenderInner<T, U> {
+    fn clone(&self) -> Self {
+        let mut state = self.shared.state.lock().panic_if_poisoned();
+        state.senders += 1;
+        drop(state);
+        SenderInner::new(self.shared.clone())
+    }
+}
+
+impl<T, U> Drop for SenderInner<T, U> {
+    fn drop(&mut self) {
+        let mut state = self.shared.state.lock().panic_if_poisoned();
+        state.senders -= 1;
+        let closed = state.senders == 0 && state.receiver_open;
+        drop(state);
+        if closed {
+            // Let the receiver observe that no more messages can arrive.
+            self.shared.recv_waker.wake();
+        }
+    }
+}
+
 pub(crate) struct Receiver<T, U> {
-    inner: mpsc::UnboundedReceiver<Envelope<T, U>>,
+    shared: Arc<Shared<T, U>>,
     taker: want::Taker,
 }
 
 impl<T, U> Receiver<T, U> {
     pub(crate) fn poll_recv(&mut self, cx: &mut Context<'_>) -> Poll<Option<(T, Callback<T, U>)>> {
-        match self.inner.poll_recv(cx) {
-            Poll::Ready(item) => {
-                // A want signaled after finding the queue empty can land after
-                // the Sender's `give()` for the message taken here, as can one
-                // signaled on a coop-budget Pending with a message queued.
-                // Withdraw it, or the Sender reports this connection as ready
-                // while it is still serving this message.
-                self.taker.unwant();
-                Poll::Ready(item.map(|mut env| env.0.take().expect("envelope not dropped")))
-            }
-            Poll::Pending => {
-                self.taker.want();
-                Poll::Pending
-            }
+        // Register before checking, so a send racing this poll cannot be lost.
+        self.shared.recv_waker.register(cx.waker());
+        let (item, senders, receiver_open) = {
+            let mut state = self.shared.state.lock().panic_if_poisoned();
+            (state.pop(), state.senders, state.receiver_open)
+        };
+        if let Some(mut env) = item {
+            // A want signaled after finding the queue empty can land after
+            // the Sender's `give()` for the message taken here.
+            // Withdraw it, or the Sender reports this connection as ready
+            // while it is still serving this message.
+            self.taker.unwant();
+            return Poll::Ready(Some(
+                env.0.take().expect("envelope not dropped"),
+            ));
+        }
+        if senders == 0 || !receiver_open {
+            self.taker.unwant();
+            Poll::Ready(None)
+        } else {
+            self.taker.want();
+            Poll::Pending
         }
     }
 
     #[cfg(feature = "http1")]
     pub(crate) fn close(&mut self) {
         self.taker.cancel();
-        self.inner.close();
+        let mut state = self.shared.state.lock().panic_if_poisoned();
+        state.receiver_open = false;
     }
 
     #[cfg(feature = "http1")]
-    pub(crate) fn poll_close(&mut self, cx: &mut Context<'_>) -> Poll<()> {
+    pub(crate) fn poll_close(&mut self, _cx: &mut Context<'_>) -> Poll<()> {
         self.close();
-        // A send that started before close may still be publishing its envelope.
-        // Keep the receiver alive until all such envelopes have been canceled.
-        while futures_core::ready!(self.inner.poll_recv(cx)).is_some() {}
+        // A send that raced the close either landed before it and is dropped
+        // here, canceling its callback, or failed and handed the request back
+        // to the caller. Once closed, no further envelopes can be queued, so
+        // the drain always completes.
+        self.drain();
         Poll::Ready(())
     }
 
     #[cfg(feature = "http1")]
     pub(crate) fn try_recv(&mut self) -> Option<(T, Callback<T, U>)> {
-        match crate::common::task::now_or_never(self.inner.recv()) {
-            Some(Some(mut env)) => env.0.take(),
-            _ => None,
-        }
+        let mut env = self.shared.state.lock().panic_if_poisoned().pop()?;
+        env.0.take()
+    }
+
+    /// Drop every queued envelope, canceling its callback.
+    fn drain(&mut self) {
+        let (first, rest) = {
+            let mut state = self.shared.state.lock().panic_if_poisoned();
+            (state.first.take(), std::mem::take(&mut state.rest))
+        };
+        drop(first);
+        drop(rest);
     }
 }
 
 impl<T, U> Drop for Receiver<T, U> {
     fn drop(&mut self) {
-        // Notify the giver about the closure first, before dropping
-        // the mpsc::Receiver.
+        // Notify the giver about the closure first, before dropping the queue.
         self.taker.cancel();
+        {
+            let mut state = self.shared.state.lock().panic_if_poisoned();
+            state.receiver_open = false;
+        }
+        // Cancel queued callbacks now, rather than whenever the last sender
+        // handle happens to be dropped.
+        self.drain();
+    }
+}
+
+/// The shared queue between the sending and receiving halves.
+///
+/// The first envelope is stored inline so that the common case, a single
+/// queued request, needs no allocation beyond the shared state itself. The
+/// previous unbounded Tokio channel allocated a 32-slot block up front, which
+/// cost roughly 8 KB per connection even when it stayed empty.
+struct Shared<T, U> {
+    state: Mutex<State<T, U>>,
+    recv_waker: AtomicWaker,
+}
+
+struct State<T, U> {
+    first: Option<Envelope<T, U>>,
+    rest: VecDeque<Envelope<T, U>>,
+    /// Number of live sending handles. The receiver observes closure when this
+    /// reaches zero and the queue is empty.
+    senders: usize,
+    /// Set once the receiver is closed or dropped, after which sends fail.
+    receiver_open: bool,
+}
+
+impl<T, U> State<T, U> {
+    fn push(&mut self, env: Envelope<T, U>) {
+        if self.first.is_none() && self.rest.is_empty() {
+            self.first = Some(env);
+        } else {
+            self.rest.push_back(env);
+        }
+    }
+
+    fn pop(&mut self) -> Option<Envelope<T, U>> {
+        if let Some(env) = self.first.take() {
+            return Some(env);
+        }
+        self.rest.pop_front()
     }
 }
 
@@ -409,6 +532,9 @@ mod tests {
     use std::pin::Pin;
     use std::task::{Context, Poll};
 
+    #[cfg(not(miri))]
+    use futures_util::task::noop_waker_ref;
+
     use super::{channel, Callback, Receiver};
 
     #[derive(Debug)]
@@ -495,6 +621,85 @@ mod tests {
         drop(rx);
 
         tx.try_send(Custom(4)).unwrap_err();
+    }
+
+    /// The unbounded sender (used by HTTP/2) may queue several messages at
+    /// once. The first goes inline and the rest into the overflow queue, and
+    /// all must come back in send order.
+    #[cfg(all(feature = "http2", not(miri)))]
+    #[tokio::test]
+    async fn receiver_yields_messages_in_order() {
+        let (tx, mut rx) = channel::<Custom, ()>();
+        let mut tx = tx.unbound();
+
+        for i in 1..=4 {
+            tx.try_send(Custom(i)).expect("buffered");
+        }
+
+        for i in 1..=4 {
+            let (msg, _cb) = rx_take(&mut rx);
+            assert_eq!(msg.0, i);
+        }
+    }
+
+    #[cfg(not(miri))]
+    fn rx_take<T, U>(rx: &mut Receiver<T, U>) -> (T, Callback<T, U>) {
+        match rx.poll_recv(&mut Context::from_waker(noop_waker_ref())) {
+            Poll::Ready(Some(item)) => item,
+            Poll::Ready(None) => panic!("expected a queued message, channel closed"),
+            Poll::Pending => panic!("expected a queued message, receiver pending"),
+        }
+    }
+
+    #[cfg(not(miri))]
+    #[tokio::test]
+    async fn receiver_reports_closed_after_last_sender_drops() {
+        let (mut tx, mut rx) = channel::<Custom, ()>();
+
+        // Queue one message, then drop the only sender.
+        tx.try_send(Custom(1)).expect("buffered");
+        drop(tx);
+
+        // The queued message is still delivered before closure is reported.
+        let (msg, _cb) = rx_take(&mut rx);
+        assert_eq!(msg.0, 1);
+
+        assert!(
+            matches!(
+                rx.poll_recv(&mut Context::from_waker(noop_waker_ref())),
+                Poll::Ready(None)
+            ),
+            "closed receiver yields None"
+        );
+    }
+
+    #[cfg(not(miri))]
+    #[tokio::test]
+    async fn queued_message_is_delivered_after_pending_poll() {
+        let (mut tx, mut rx) = channel::<Custom, ()>();
+
+        // Poll while empty to signal want and park.
+        assert!(PollOnce(&mut rx).await.is_none(), "rx empty");
+
+        // A message sent after the pending poll must be visible to the next
+        // poll, without another wake-up in between.
+        tx.try_send(Custom(7)).expect("ready");
+        let (msg, _cb) = rx_take(&mut rx);
+        assert_eq!(msg.0, 7);
+    }
+
+    /// The queue must not allocate a large block up front. The common case is a
+    /// single queued request, so the first envelope is stored inline and the
+    /// overflow queue starts empty.
+    #[test]
+    fn first_message_does_not_allocate_the_overflow_queue() {
+        let (mut tx, rx) = channel::<Custom, ()>();
+
+        tx.try_send(Custom(1)).expect("buffered");
+
+        let state = rx.shared.state.lock().unwrap();
+        assert!(state.first.is_some());
+        assert_eq!(state.rest.capacity(), 0, "overflow queue stays unallocated");
     }
 
     #[cfg(feature = "nightly")]

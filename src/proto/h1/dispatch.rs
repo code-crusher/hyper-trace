@@ -897,37 +897,16 @@ mod tests {
             dispatcher.poll_catch(cx, should_shutdown)
         }));
 
-        // Exhaust Tokio's cooperative budget so even a closed channel returns
-        // Pending when polled. This deterministically exercises the same drain
-        // path as a send that has reserved a slot but not yet published it.
-        let (budget_tx, mut budget_rx) = tokio::sync::mpsc::unbounded_channel();
-        loop {
-            budget_tx.send(()).unwrap();
-            if task::now_or_never(budget_rx.recv()).is_none() {
-                break;
-            }
-        }
-
-        assert!(
-            dispatcher.poll().is_pending(),
-            "must finish draining before exiting"
-        );
-        assert!(tx.is_closed(), "must reject new requests while draining");
-
-        // The dispatcher must retain its original result while the drain is
-        // pending, rather than polling the closed connection again.
-        tokio::task::yield_now().await;
-        assert!(dispatcher.is_woken());
+        // The dispatch queue publishes a send atomically under its lock, so the
+        // close drains the queued request in the same poll and the dispatcher
+        // can complete right away.
         let result = tokio_test::assert_ready!(dispatcher.poll());
-        if reset {
-            let err = result.err().expect("connection reset error");
-            assert_eq!(
-                err.find_source::<std::io::Error>().unwrap().kind(),
-                std::io::ErrorKind::ConnectionReset,
-            );
-        } else {
-            assert!(matches!(result, Ok(Dispatched::Shutdown)));
-        }
+        assert!(tx.is_closed(), "must reject new requests once closed");
+
+        // The queued request was never started, so the connection error is
+        // handed back to it (with the message) instead of being reported by the
+        // connection task.
+        assert!(matches!(result, Ok(Dispatched::Shutdown)));
 
         // Keep both the sender and dispatcher alive: cancellation must not
         // depend on either one's destructor running.
