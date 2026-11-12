@@ -57,6 +57,7 @@ where
                 keep_alive: KA::Busy,
                 method: None,
                 h1_parser_config: ParserConfig::default(),
+                allow_spaces_after_header_name_in_requests: false,
                 h1_max_headers: None,
                 h1_max_header_size: None,
                 #[cfg(feature = "server")]
@@ -118,6 +119,11 @@ where
 
     pub(crate) fn set_h1_parser_config(&mut self, parser_config: ParserConfig) {
         self.state.h1_parser_config = parser_config;
+    }
+
+    #[cfg(feature = "server")]
+    pub(crate) fn set_allow_spaces_after_header_name_in_requests(&mut self) {
+        self.state.allow_spaces_after_header_name_in_requests = true;
     }
 
     pub(crate) fn set_title_case_headers(&mut self) {
@@ -244,6 +250,9 @@ where
             ParseContext {
                 cached_headers: &mut self.state.cached_headers,
                 req_method: &mut self.state.method,
+                allow_spaces_after_header_name_in_requests: self
+                    .state
+                    .allow_spaces_after_header_name_in_requests,
                 h1_parser_config: self.state.h1_parser_config.clone(),
                 h1_max_headers: self.state.h1_max_headers,
                 h1_max_header_size: self.state.h1_max_header_size,
@@ -951,6 +960,10 @@ struct State {
     /// a body or not.
     method: Option<Method>,
     h1_parser_config: ParserConfig,
+    /// Whether request heads may contain whitespace between header names and
+    /// their colon. Kept apart from `h1_parser_config` since `httparse`
+    /// doesn't support this for requests, unlike responses.
+    allow_spaces_after_header_name_in_requests: bool,
     h1_max_headers: Option<usize>,
     h1_max_header_size: Option<usize>,
     #[cfg(feature = "server")]

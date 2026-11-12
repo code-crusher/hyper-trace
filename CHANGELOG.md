@@ -1,3 +1,9 @@
+# Unreleased
+
+#### Features
+
+* **http1:** add `Builder::allow_spaces_after_header_name_in_requests` to server HTTP/1 connections (#3834)
+
 ## v1.12.0 (2026-10-06)
 
 

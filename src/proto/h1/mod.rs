@@ -71,6 +71,10 @@ pub(crate) struct ParsedMessage<T> {
 pub(crate) struct ParseContext<'ctx> {
     cached_headers: &'ctx mut Option<HeaderMap>,
     req_method: &'ctx mut Option<Method>,
+    /// Whether whitespace between request header names and their colon may be
+    /// tolerated. Split out of `h1_parser_config`, since upstream `httparse`
+    /// has no such option for requests (as it does for responses).
+    allow_spaces_after_header_name_in_requests: bool,
     h1_parser_config: ParserConfig,
     h1_max_headers: Option<usize>,
     h1_max_header_size: Option<usize>,

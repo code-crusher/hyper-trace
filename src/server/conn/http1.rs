@@ -76,6 +76,7 @@ pub struct Builder {
     h1_keep_alive: bool,
     h1_title_case_headers: bool,
     h1_preserve_header_case: bool,
+    h1_allow_spaces_after_header_name_in_requests: bool,
     h1_max_headers: Option<usize>,
     h1_max_header_size: Option<usize>,
     h1_header_read_timeout: Dur,
@@ -248,6 +249,7 @@ impl Builder {
             h1_keep_alive: true,
             h1_title_case_headers: false,
             h1_preserve_header_case: false,
+            h1_allow_spaces_after_header_name_in_requests: false,
             h1_max_headers: None,
             h1_max_header_size: None,
             h1_header_read_timeout: Dur::Default(Some(Duration::from_secs(30))),
@@ -306,6 +308,28 @@ impl Builder {
     pub fn ignore_invalid_headers(&mut self, enabled: bool) -> &mut Builder {
         self.h1_parser_config
             .ignore_invalid_headers_in_requests(enabled);
+        self
+    }
+
+    /// Set whether HTTP/1 connections will accept spaces between header names
+    /// and the colon that follow them in requests.
+    ///
+    /// You probably don't need this, here is what [RFC 7230 Section 3.2.4.] has
+    /// to say about it:
+    ///
+    /// > No whitespace is allowed between the header field-name and colon. In
+    /// > the past, differences in the handling of such whitespace have led to
+    /// > security vulnerabilities in request routing and response handling. A
+    /// > server MUST reject any received request message that contains
+    /// > whitespace between a header field-name and colon with a response code
+    /// > of 400 (Bad Request). A proxy MUST remove any such whitespace from a
+    /// > response message before forwarding the message downstream.
+    ///
+    /// Default is `false`.
+    ///
+    /// [RFC 7230 Section 3.2.4.]: https://tools.ietf.org/html/rfc7230#section-3.2.4
+    pub fn allow_spaces_after_header_name_in_requests(&mut self, enabled: bool) -> &mut Builder {
+        self.h1_allow_spaces_after_header_name_in_requests = enabled;
         self
     }
 
@@ -477,6 +501,9 @@ impl Builder {
     {
         let mut conn = proto::Conn::new(io);
         conn.set_h1_parser_config(self.h1_parser_config.clone());
+        if self.h1_allow_spaces_after_header_name_in_requests {
+            conn.set_allow_spaces_after_header_name_in_requests();
+        }
         conn.set_timer(self.timer.clone());
         if !self.h1_keep_alive {
             conn.disable_keep_alive();

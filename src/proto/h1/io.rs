@@ -186,6 +186,8 @@ where
                 ParseContext {
                     cached_headers: parse_ctx.cached_headers,
                     req_method: parse_ctx.req_method,
+                    allow_spaces_after_header_name_in_requests: parse_ctx
+                        .allow_spaces_after_header_name_in_requests,
                     h1_parser_config: parse_ctx.h1_parser_config.clone(),
                     h1_max_headers: parse_ctx.h1_max_headers,
                     h1_max_header_size: parse_ctx.h1_max_header_size,
@@ -702,6 +704,7 @@ mod tests {
             let parse_ctx = ParseContext {
                 cached_headers: &mut None,
                 req_method: &mut None,
+                allow_spaces_after_header_name_in_requests: false,
                 h1_parser_config: Default::default(),
                 h1_max_headers: None,
                 h1_max_header_size: None,

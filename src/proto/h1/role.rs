@@ -172,6 +172,19 @@ impl Http1Transaction for Server {
                 };
             trace!(bytes = buf.len(), "Request.parse");
             let mut req = httparse::Request::new(&mut []);
+
+            // If enabled, tolerate spaces between header names and colons by
+            // scrubbing them out before `httparse` sees the buffer.
+            let spaces_scan = if ctx.allow_spaces_after_header_name_in_requests {
+                let scan = spaces_after_header_name::scan(buf);
+                if let spaces_after_header_name::Scan::Complete(removals) = &scan {
+                    spaces_after_header_name::remove_ranges(buf, removals);
+                }
+                Some(scan)
+            } else {
+                None
+            };
+
             let bytes = buf.as_ref();
             match ctx.h1_parser_config.parse_request_with_uninit_headers(
                 &mut req,
@@ -217,6 +230,18 @@ impl Http1Transaction for Server {
                             Parse::Uri
                         }
                     })
+                }
+                // If the head is only partially buffered, the offending byte
+                // may yet turn out to be part of a header name-colon gap we
+                // are asked to tolerate, so wait for the rest of it instead
+                // of failing the connection.
+                Err(httparse::Error::HeaderName)
+                    if spaces_scan
+                        .as_ref()
+                        .map_or(false, spaces_after_header_name::Scan::is_incomplete) =>
+                {
+                    trace!("partial head with invalid header name byte, waiting for more");
+                    return Ok(None);
                 }
                 Err(err) => return Err(err.into()),
             }
@@ -1575,6 +1600,155 @@ struct HeaderIndices {
     value: (usize, usize),
 }
 
+#[cfg(feature = "server")]
+mod spaces_after_header_name {
+    //! Support for tolerating whitespace between request header names and
+    //! their colon (`Header : value`).
+    //!
+    //! `httparse` only supports this leniency for responses, and it has no
+    //! request-side counterpart as of 1.10 (see
+    //! <https://github.com/seanmonstar/httparse/issues/88>). Since hyper
+    //! cannot ask `httparse` to accept those requests, it instead scans the
+    //! head itself and, if the only offending bytes are spaces or tabs
+    //! between a header name and its colon, removes them from the buffer
+    //! before handing it back to `httparse`.
+
+    use bytes::BytesMut;
+
+    /// Mirrors `httparse`'s header name token map.
+    fn is_header_name_token(b: u8) -> bool {
+        matches!(b,
+            b'A'..=b'Z'
+                | b'a'..=b'z'
+                | b'0'..=b'9'
+                | b'!'
+                | b'#'
+                | b'$'
+                | b'%'
+                | b'&'
+                | b'\''
+                | b'*'
+                | b'+'
+                | b'-'
+                | b'.'
+                | b'^'
+                | b'_'
+                | b'`'
+                | b'|'
+                | b'~'
+        )
+    }
+
+    /// A scan of a request head for spaces between header names and colons.
+    #[derive(Debug)]
+    pub(super) enum Scan {
+        /// The head isn't fully buffered yet.
+        Incomplete,
+        /// The head is complete; carries the byte ranges of spaces and tabs
+        /// sitting between header names and their colon.
+        Complete(Vec<(usize, usize)>),
+    }
+
+    impl Scan {
+        pub(super) fn is_incomplete(&self) -> bool {
+            matches!(self, Scan::Incomplete)
+        }
+    }
+
+    /// Scans `buf` for whitespace between request header names and colons.
+    ///
+    /// Only runs when the leniency is enabled, so simplicity beats speed
+    /// here. The request line is not validated: `Error::HeaderName` can
+    /// only surface from `httparse` once it has parsed the request line,
+    /// which cannot contain a newline, so the first one marks its end.
+    pub(super) fn scan(buf: &[u8]) -> Scan {
+        let len = buf.len();
+        let mut pos = 0;
+
+        // Skip leading empty lines, like `httparse` does.
+        loop {
+            match buf.get(pos) {
+                Some(b'\r') if buf.get(pos + 1) == Some(&b'\n') => pos += 2,
+                Some(b'\n') => pos += 1,
+                _ => break,
+            }
+        }
+
+        // Skip the request line, up to and past its newline.
+        while pos < len && buf[pos] != b'\n' {
+            pos += 1;
+        }
+        if pos == len {
+            return Scan::Incomplete;
+        }
+        pos += 1;
+
+        let mut removals = Vec::new();
+        loop {
+            match buf.get(pos) {
+                None => return Scan::Incomplete,
+                // An empty line ends the head.
+                Some(b'\n') => return Scan::Complete(removals),
+                Some(b'\r') if buf.get(pos + 1) == Some(&b'\n') => {
+                    return Scan::Complete(removals)
+                }
+                _ => {}
+            }
+
+            // The header name.
+            let name_start = pos;
+            while pos < len && is_header_name_token(buf[pos]) {
+                pos += 1;
+            }
+
+            // Whitespace between the name and the colon is the tolerated
+            // malformation. Only flag it after a non-empty name, so that
+            // obs-fold lines (which start with whitespace) are left alone.
+            if pos < len && (buf[pos] == b' ' || buf[pos] == b'\t') {
+                let run_start = pos;
+                while pos < len && (buf[pos] == b' ' || buf[pos] == b'\t') {
+                    pos += 1;
+                }
+                if pos == len {
+                    return Scan::Incomplete;
+                }
+                if buf[pos] == b':' && run_start > name_start {
+                    removals.push((run_start, pos));
+                }
+            }
+
+            // The rest of the line is the value; none of our business.
+            while pos < len && buf[pos] != b'\n' {
+                pos += 1;
+            }
+            if pos == len {
+                return Scan::Incomplete;
+            }
+            pos += 1;
+        }
+    }
+
+    /// Removes the given byte ranges, shifting the rest of `buf` left.
+    ///
+    /// The ranges must be sorted and non-overlapping.
+    pub(super) fn remove_ranges(buf: &mut BytesMut, ranges: &[(usize, usize)]) {
+        let mut shift = 0;
+        let mut prev_end = 0;
+        for &(start, end) in ranges {
+            if shift > 0 {
+                buf.copy_within(prev_end..start, prev_end - shift);
+            }
+            shift += end - start;
+            prev_end = end;
+        }
+        if shift > 0 {
+            let len = buf.len();
+            buf.copy_within(prev_end..len, prev_end - shift);
+            buf.truncate(len - shift);
+        }
+    }
+}
+
 fn record_header_indices(
     bytes: &[u8],
     headers: &[httparse::Header<'_>],
@@ -1710,6 +1884,7 @@ mod tests {
             ParseContext {
                 cached_headers: &mut None,
                 req_method: &mut method,
+                allow_spaces_after_header_name_in_requests: false,
                 h1_parser_config: Default::default(),
                 h1_max_headers: None,
                 h1_max_header_size: None,
@@ -1739,6 +1914,7 @@ mod tests {
         let ctx = ParseContext {
             cached_headers: &mut None,
             req_method: &mut Some(crate::Method::GET),
+            allow_spaces_after_header_name_in_requests: false,
             h1_parser_config: Default::default(),
             h1_max_headers: None,
             h1_max_header_size: None,
@@ -1764,6 +1940,7 @@ mod tests {
         let ctx = ParseContext {
             cached_headers: &mut None,
             req_method: &mut None,
+            allow_spaces_after_header_name_in_requests: false,
             h1_parser_config: Default::default(),
             h1_max_headers: None,
             h1_max_header_size: None,
@@ -1786,6 +1963,7 @@ mod tests {
         let ctx = ParseContext {
             cached_headers: &mut None,
             req_method: &mut Some(crate::Method::GET),
+            allow_spaces_after_header_name_in_requests: false,
             h1_parser_config: Default::default(),
             h1_max_headers: None,
             h1_max_header_size: None,
@@ -1810,6 +1988,7 @@ mod tests {
         let ctx = ParseContext {
             cached_headers: &mut None,
             req_method: &mut Some(crate::Method::GET),
+            allow_spaces_after_header_name_in_requests: false,
             h1_parser_config: Default::default(),
             h1_max_headers: None,
             h1_max_header_size: None,
@@ -1838,6 +2017,7 @@ mod tests {
         let ctx = ParseContext {
             cached_headers: &mut None,
             req_method: &mut Some(crate::Method::GET),
+            allow_spaces_after_header_name_in_requests: false,
             h1_parser_config,
             h1_max_headers: None,
             h1_max_header_size: None,
@@ -1863,6 +2043,7 @@ mod tests {
         let ctx = ParseContext {
             cached_headers: &mut None,
             req_method: &mut Some(crate::Method::GET),
+            allow_spaces_after_header_name_in_requests: false,
             h1_parser_config: Default::default(),
             h1_max_headers: None,
             h1_max_header_size: None,
@@ -1892,6 +2073,7 @@ mod tests {
         let ctx = ParseContext {
             cached_headers: &mut None,
             req_method: &mut method,
+            allow_spaces_after_header_name_in_requests: false,
             h1_parser_config,
             h1_max_headers: None,
             h1_max_header_size: None,
@@ -1920,6 +2102,117 @@ mod tests {
         let ctx = ParseContext {
             cached_headers: &mut None,
             req_method: &mut None,
+            allow_spaces_after_header_name_in_requests: false,
+            h1_parser_config: Default::default(),
+            h1_max_headers: None,
+            h1_max_header_size: None,
+            preserve_header_case: false,
+            #[cfg(feature = "ffi")]
+            preserve_header_order: false,
+            h09_responses: false,
+            #[cfg(feature = "client")]
+            on_informational: &mut None,
+        };
+        Server::parse(&mut raw, ctx).unwrap_err();
+    }
+
+    const REQUEST_WITH_WHITESPACE_BETWEEN_HEADER_NAME_AND_COLON: &str =
+        "GET / HTTP/1.1\r\nHost : hyper.rs\r\n\r\n";
+
+    #[cfg(feature = "server")]
+    #[test]
+    fn test_parse_allow_request_with_spaces_before_colons() {
+        let _ = pretty_env_logger::try_init();
+        let mut raw = BytesMut::from(REQUEST_WITH_WHITESPACE_BETWEEN_HEADER_NAME_AND_COLON);
+        let ctx = ParseContext {
+            cached_headers: &mut None,
+            req_method: &mut None,
+            allow_spaces_after_header_name_in_requests: true,
+            h1_parser_config: Default::default(),
+            h1_max_headers: None,
+            h1_max_header_size: None,
+            preserve_header_case: false,
+            #[cfg(feature = "ffi")]
+            preserve_header_order: false,
+            h09_responses: false,
+            #[cfg(feature = "client")]
+            on_informational: &mut None,
+        };
+        let msg = Server::parse(&mut raw, ctx).unwrap().unwrap();
+        assert_eq!(raw.len(), 0);
+        assert_eq!(msg.head.subject.0, crate::Method::GET);
+        assert_eq!(msg.head.subject.1, "/");
+        assert_eq!(msg.head.version, crate::Version::HTTP_11);
+        assert_eq!(msg.head.headers.len(), 1);
+        assert_eq!(msg.head.headers["Host"], "hyper.rs");
+    }
+
+    #[cfg(feature = "server")]
+    #[test]
+    fn test_parse_reject_request_with_spaces_before_colons() {
+        let _ = pretty_env_logger::try_init();
+        let mut raw = BytesMut::from(REQUEST_WITH_WHITESPACE_BETWEEN_HEADER_NAME_AND_COLON);
+        let ctx = ParseContext {
+            cached_headers: &mut None,
+            req_method: &mut None,
+            allow_spaces_after_header_name_in_requests: false,
+            h1_parser_config: Default::default(),
+            h1_max_headers: None,
+            h1_max_header_size: None,
+            preserve_header_case: false,
+            #[cfg(feature = "ffi")]
+            preserve_header_order: false,
+            h09_responses: false,
+            #[cfg(feature = "client")]
+            on_informational: &mut None,
+        };
+        Server::parse(&mut raw, ctx).unwrap_err();
+    }
+
+    #[cfg(feature = "server")]
+    #[test]
+    fn test_parse_allow_request_with_spaces_before_colons_partial() {
+        // A header line with the malformation arriving split across reads
+        // must wait for more bytes instead of failing the connection.
+        let _ = pretty_env_logger::try_init();
+        macro_rules! ctx {
+            () => {
+                ParseContext {
+                    cached_headers: &mut None,
+                    req_method: &mut None,
+                    allow_spaces_after_header_name_in_requests: true,
+                    h1_parser_config: Default::default(),
+                    h1_max_headers: None,
+                    h1_max_header_size: None,
+                    preserve_header_case: false,
+                    #[cfg(feature = "ffi")]
+                    preserve_header_order: false,
+                    h09_responses: false,
+                    #[cfg(feature = "client")]
+                    on_informational: &mut None,
+                }
+            };
+        }
+        let mut raw = BytesMut::from("GET / HTTP/1.1\r\nHost ");
+        assert!(Server::parse(&mut raw, ctx!()).unwrap().is_none());
+        raw.extend_from_slice(b": hyper.rs\r\n\r\n");
+        let msg = Server::parse(&mut raw, ctx!()).unwrap().unwrap();
+        assert_eq!(raw.len(), 0);
+        assert_eq!(msg.head.headers.len(), 1);
+        assert_eq!(msg.head.headers["Host"], "hyper.rs");
+    }
+
+    #[cfg(feature = "server")]
+    #[test]
+    fn test_parse_allow_request_with_spaces_before_colons_rejects_other_malformations() {
+        // Invalid header name characters must still be rejected when the
+        // leniency is enabled.
+        let _ = pretty_env_logger::try_init();
+        let mut raw = BytesMut::from("GET / HTTP/1.1\r\nHost\u{1}: hyper.rs\r\n\r\n");
+        let ctx = ParseContext {
+            cached_headers: &mut None,
+            req_method: &mut None,
+            allow_spaces_after_header_name_in_requests: true,
             h1_parser_config: Default::default(),
             h1_max_headers: None,
             h1_max_header_size: None,
@@ -1941,6 +2234,7 @@ mod tests {
         let ctx = ParseContext {
             cached_headers: &mut None,
             req_method: &mut None,
+            allow_spaces_after_header_name_in_requests: false,
             h1_parser_config: Default::default(),
             h1_max_headers: None,
             h1_max_header_size: None,
@@ -1981,6 +2275,7 @@ mod tests {
                 ParseContext {
                     cached_headers: &mut None,
                     req_method: &mut None,
+                    allow_spaces_after_header_name_in_requests: false,
                     h1_parser_config: Default::default(),
                     h1_max_headers: None,
                     h1_max_header_size: None,
@@ -2003,6 +2298,7 @@ mod tests {
                 ParseContext {
                     cached_headers: &mut None,
                     req_method: &mut None,
+                    allow_spaces_after_header_name_in_requests: false,
                     h1_parser_config: Default::default(),
                     h1_max_headers: None,
                     h1_max_header_size: None,
@@ -2244,6 +2540,7 @@ mod tests {
                 ParseContext {
                     cached_headers: &mut None,
                     req_method: &mut Some(Method::GET),
+                    allow_spaces_after_header_name_in_requests: false,
                     h1_parser_config: Default::default(),
                     h1_max_headers: None,
                     h1_max_header_size: None,
@@ -2266,6 +2563,7 @@ mod tests {
                 ParseContext {
                     cached_headers: &mut None,
                     req_method: &mut Some(m),
+                    allow_spaces_after_header_name_in_requests: false,
                     h1_parser_config: Default::default(),
                     h1_max_headers: None,
                     h1_max_header_size: None,
@@ -2288,6 +2586,7 @@ mod tests {
                 ParseContext {
                     cached_headers: &mut None,
                     req_method: &mut Some(Method::GET),
+                    allow_spaces_after_header_name_in_requests: false,
                     h1_parser_config: Default::default(),
                     h1_max_headers: None,
                     h1_max_header_size: None,
@@ -2572,6 +2871,7 @@ mod tests {
                 ParseContext {
                     cached_headers: &mut None,
                     req_method: &mut None,
+                    allow_spaces_after_header_name_in_requests: false,
                     h1_parser_config: Default::default(),
                     h1_max_headers: None,
                     h1_max_header_size: None,
@@ -2650,6 +2950,7 @@ mod tests {
                 ParseContext {
                     cached_headers: &mut None,
                     req_method: &mut Some(Method::GET),
+                    allow_spaces_after_header_name_in_requests: false,
                     h1_parser_config: Default::default(),
                     h1_max_headers: None,
                     h1_max_header_size: None,
@@ -3131,6 +3432,7 @@ mod tests {
             ParseContext {
                 cached_headers: &mut None,
                 req_method: &mut Some(Method::GET),
+                allow_spaces_after_header_name_in_requests: false,
                 h1_parser_config: Default::default(),
                 h1_max_headers: None,
                 h1_max_header_size: None,
@@ -3176,6 +3478,7 @@ mod tests {
                     ParseContext {
                         cached_headers: &mut None,
                         req_method: &mut None,
+                        allow_spaces_after_header_name_in_requests: false,
                         h1_parser_config: Default::default(),
                         h1_max_headers: max_headers,
                         h1_max_header_size: None,
@@ -3201,6 +3504,7 @@ mod tests {
                     ParseContext {
                         cached_headers: &mut None,
                         req_method: &mut None,
+                        allow_spaces_after_header_name_in_requests: false,
                         h1_parser_config: Default::default(),
                         h1_max_headers: max_headers,
                         h1_max_header_size: None,
@@ -3295,6 +3599,7 @@ mod tests {
                 ParseContext {
                     cached_headers: &mut None,
                     req_method: &mut None,
+                    allow_spaces_after_header_name_in_requests: false,
                     h1_parser_config: Default::default(),
                     h1_max_headers: None,
                     h1_max_header_size: max_header_size,
@@ -3331,6 +3636,7 @@ mod tests {
                 ParseContext {
                     cached_headers: &mut None,
                     req_method: &mut None,
+                    allow_spaces_after_header_name_in_requests: false,
                     h1_parser_config: Default::default(),
                     h1_max_headers: None,
                     h1_max_header_size: max_header_size,
@@ -3394,6 +3700,7 @@ mod tests {
             ParseContext {
                 cached_headers: &mut None,
                 req_method: &mut None,
+                allow_spaces_after_header_name_in_requests: false,
                 h1_parser_config: Default::default(),
                 h1_max_headers: None,
                 h1_max_header_size: None,
@@ -3478,6 +3785,7 @@ mod tests {
                 ParseContext {
                     cached_headers: &mut headers,
                     req_method: &mut None,
+                    allow_spaces_after_header_name_in_requests: false,
                     h1_parser_config: Default::default(),
                     h1_max_headers: None,
                     h1_max_header_size: None,
@@ -3524,6 +3832,7 @@ mod tests {
                 ParseContext {
                     cached_headers: &mut headers,
                     req_method: &mut None,
+                    allow_spaces_after_header_name_in_requests: false,
                     h1_parser_config: Default::default(),
                     h1_max_headers: None,
                     h1_max_header_size: None,

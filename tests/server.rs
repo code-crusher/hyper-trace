@@ -4148,3 +4148,86 @@ impl TestClient {
         }
     }
 }
+
+// NOTE: this is intentionally at the top level, using the low-level server
+// builder, to also exercise the `Builder` plumbing of the option.
+#[tokio::test]
+async fn http1_server_allow_spaces_after_header_name_in_requests() {
+    let _ = pretty_env_logger::try_init();
+    let (client_io, server_io) = tokio::io::duplex(1024);
+
+    // Send the request with a space between header name and colon.
+    let client_task = tokio::spawn(async move {
+        let mut client_io = client_io;
+        client_io
+            .write_all(b"GET / HTTP/1.1\r\nHost : hyper.rs\r\nConnection: close\r\n\r\n")
+            .await
+            .unwrap();
+        let mut buf = vec![];
+        client_io.read_to_end(&mut buf).await.unwrap();
+        buf
+    });
+
+    let svc = service_fn(|req: Request<IncomingBody>| {
+        let host = req
+            .headers()
+            .get("host")
+            .map(|value| value.to_str().unwrap().to_owned())
+            .unwrap_or_default();
+        future::ok::<_, hyper::Error>(
+            Response::builder()
+                .status(200)
+                .header("x-echo-host", host)
+                .body(Full::new(Bytes::from(HELLO)))
+                .unwrap(),
+        )
+    });
+
+    let server_io = TokioIo::new(server_io);
+    http1::Builder::new()
+        .allow_spaces_after_header_name_in_requests(true)
+        .serve_connection(server_io, svc)
+        .await
+        .unwrap();
+
+    let buf = client_task.await.unwrap();
+    let sbuf = s(&buf);
+    assert!(sbuf.starts_with("HTTP/1.1 200 OK\r\n"), "buf: {:?}", sbuf);
+    assert!(
+        sbuf.to_ascii_lowercase()
+            .contains("x-echo-host: hyper.rs\r\n"),
+        "header should have been parsed, buf: {:?}",
+        sbuf,
+    );
+}
+
+#[tokio::test]
+async fn http1_server_reject_spaces_after_header_name_by_default() {
+    let _ = pretty_env_logger::try_init();
+    let (client_io, server_io) = tokio::io::duplex(1024);
+
+    let client_task = tokio::spawn(async move {
+        let mut client_io = client_io;
+        client_io
+            .write_all(b"GET / HTTP/1.1\r\nHost : hyper.rs\r\n\r\n")
+            .await
+            .unwrap();
+        let mut buf = vec![];
+        client_io.read_to_end(&mut buf).await.unwrap();
+        buf
+    });
+
+    let server_io = TokioIo::new(server_io);
+    let result = http1::Builder::new()
+        .serve_connection(server_io, HelloWorld)
+        .await;
+
+    // The malformed header must fail the connection.
+    assert!(result.is_err(), "expected error, got {:?}", result);
+    let buf = client_task.await.unwrap();
+    assert!(
+        s(&buf).starts_with("HTTP/1.1 400"),
+        "expected 400 Bad Request, buf: {:?}",
+        s(&buf),
+    );
+}
