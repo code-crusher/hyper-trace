@@ -1693,6 +1693,72 @@ mod conn {
         future::join(server, client).await;
     }
 
+    // https://github.com/hyperium/hyper/issues/3746
+    //
+    // `String` is the only native buffer type that implements `Body`, because
+    // `http-body` provides that impl. Other buffers such as `Vec<u8>` are
+    // foreign to hyper, so the orphan rules forbid hyper from implementing
+    // `Body` for them; they need a wrapper from `http-body-util`. Both forms
+    // must put the same bytes on the wire.
+    #[tokio::test]
+    async fn post_string_and_vec_bodies() {
+        let (listener, addr) = setup_tk_test_server().await;
+
+        // Both body forms must produce the same request on the wire.
+        let server = async move {
+            let expected = "\
+                POST / HTTP/1.1\r\n\
+                content-length: 3\r\n\
+                \r\n\
+                abc\
+                ";
+
+            for _ in 0..2 {
+                let mut sock = listener.accept().await.unwrap().0;
+                let mut buf = [0; 4096];
+                let n = sock.read(&mut buf).await.expect("read 1");
+                assert_eq!(s(&buf[..n]), expected);
+
+                sock.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+                    .await
+                    .unwrap();
+            }
+        };
+
+        let client = async move {
+            async fn send<B>(addr: &SocketAddr, body: B)
+            where
+                B: hyper::body::Body + Send + 'static,
+                B::Data: Send,
+                B::Error: Into<Box<dyn Error + Send + Sync>>,
+            {
+                let tcp = tcp_connect(addr).await.expect("connect");
+                let (mut client, conn) = conn::http1::handshake(tcp).await.expect("handshake");
+
+                tokio::task::spawn(async move {
+                    conn.await.expect("http conn");
+                });
+
+                let req = Request::builder()
+                    .method(Method::POST)
+                    .uri("/")
+                    .body(body)
+                    .unwrap();
+                let mut res = client.send_request(req).await.expect("send_request");
+                assert_eq!(res.status(), hyper::StatusCode::OK);
+                assert!(res.body_mut().frame().await.is_none());
+            }
+
+            // A `String` is a `Body` without any wrapper.
+            send(&addr, String::from("abc")).await;
+
+            // A `Vec<u8>` needs a wrapper from `http-body-util`.
+            send(&addr, Full::<Bytes>::from(vec![b'a', b'b', b'c'])).await;
+        };
+
+        future::join(server, client).await;
+    }
+
     #[tokio::test]
     async fn get_custom_reason_phrase() {
         let (listener, addr) = setup_tk_test_server().await;
