@@ -276,6 +276,34 @@ impl Error {
         matches!(self.inner.kind, Kind::IncompleteMessage)
     }
 
+    /// Returns true if the error was caused while reading a body from the
+    /// connection.
+    ///
+    /// This can happen when the connection reports an error while hyper is
+    /// reading the request or response body.
+    #[cfg(all(
+        any(feature = "client", feature = "server"),
+        any(feature = "http1", feature = "http2")
+    ))]
+    pub fn is_body(&self) -> bool {
+        matches!(self.inner.kind, Kind::Body)
+    }
+
+    /// Returns true if the error was caused while writing a body to the
+    /// connection.
+    ///
+    /// This can happen when the connection reports an error while hyper is
+    /// writing the request or response body, for example because the peer
+    /// closed the connection. Such an error may be retryable on a new
+    /// connection.
+    #[cfg(all(
+        any(feature = "client", feature = "server"),
+        any(feature = "http1", feature = "http2")
+    ))]
+    pub fn is_body_write(&self) -> bool {
+        matches!(self.inner.kind, Kind::BodyWrite)
+    }
+
     /// Returns true if the body write was aborted.
     ///
     /// This occurs when the user's code explicitly aborts writing of the
@@ -713,6 +741,29 @@ mod tests {
     #[test]
     fn error_size_of() {
         assert_eq!(mem::size_of::<Error>(), mem::size_of::<usize>());
+    }
+
+    #[cfg(all(
+        any(feature = "client", feature = "server"),
+        any(feature = "http1", feature = "http2")
+    ))]
+    #[test]
+    fn error_is_body() {
+        let body = Error::new_body("message");
+        assert!(body.is_body());
+        assert!(!body.is_body_write());
+
+        let body_write = Error::new_body_write("message");
+        assert!(!body_write.is_body());
+        assert!(body_write.is_body_write());
+    }
+
+    #[cfg(all(feature = "http1", any(feature = "client", feature = "server")))]
+    #[test]
+    fn error_is_body_write_distinct_from_aborted() {
+        let aborted = Error::new_body_write_aborted();
+        assert!(aborted.is_body_write_aborted());
+        assert!(!aborted.is_body_write());
     }
 
     #[cfg(feature = "http2")]
