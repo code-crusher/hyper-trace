@@ -94,6 +94,72 @@ where
     T::parse(bytes, ctx)
 }
 
+/// The number of bytes httparse consumes to try to match the version token,
+/// regardless of whether it matches.
+const VERSION_TOKEN_LEN: usize = 8;
+
+/// Extract the bytes where the HTTP version was expected, to include in the
+/// `Parse::Version` error.
+///
+/// `start` is the offset into `bytes` where the version token begins.
+/// The returned slice is capped at `VERSION_TOKEN_LEN` bytes, or fewer if the
+/// buffer ends first.
+fn version_token_snippet(bytes: &[u8], start: usize) -> &[u8] {
+    let rest = &bytes[start.min(bytes.len())..];
+    let len = rest.len().min(VERSION_TOKEN_LEN);
+    &rest[..len]
+}
+
+/// Skip any leading empty lines (`\r\n` or `\n`), returning the offset of
+/// the first non-empty line. httparse consumes these before matching the
+/// version token.
+///
+/// Used only to produce a diagnostic snippet, so being off by a byte just
+/// shifts the snippet; it never affects protocol behavior.
+fn skip_leading_empty_lines(bytes: &[u8]) -> usize {
+    let mut i = 0;
+    while let Some(&b) = bytes.get(i) {
+        match b {
+            b'\r' => {
+                if bytes.get(i + 1) == Some(&b'\n') {
+                    i += 2;
+                } else {
+                    return i;
+                }
+            }
+            b'\n' => i += 1,
+            _ => return i,
+        }
+    }
+    bytes.len()
+}
+
+/// Estimate the offset of the HTTP version token in a response line: the
+/// first token of the first non-empty line.
+fn version_start_response(bytes: &[u8]) -> usize {
+    skip_leading_empty_lines(bytes)
+}
+
+/// Estimate the offset of the HTTP version token in a request line.
+///
+/// After any leading empty lines, the request line is
+/// `METHOD SP request-target SP HTTP-version`, so skip two non-space tokens
+/// (and the spaces between them) to reach the version.
+fn version_start_request(bytes: &[u8]) -> usize {
+    let mut i = skip_leading_empty_lines(bytes);
+    for _ in 0..2 {
+        // Skip the token (method, then request-target), then the spaces
+        // between it and the next token.
+        while matches!(bytes.get(i), Some(&b) if b != b' ') {
+            i += 1;
+        }
+        while bytes.get(i) == Some(&b' ') {
+            i += 1;
+        }
+    }
+    i
+}
+
 /// A fast scan for the end of a message.
 /// Used when there was a partial read, to skip full parsing on a
 /// a slow connection.
@@ -217,6 +283,11 @@ impl Http1Transaction for Server {
                             Parse::Uri
                         }
                     })
+                }
+                Err(httparse::Error::Version) => {
+                    return Err(Parse::Version(crate::error::InvalidVersion::new(
+                        version_token_snippet(bytes, version_start_request(bytes)),
+                    )));
                 }
                 Err(err) => return Err(err.into()),
             }
@@ -493,7 +564,7 @@ impl Http1Transaction for Server {
     fn on_error(err: &crate::Error) -> Option<MessageHead<Self::Outgoing>> {
         use crate::error::Kind;
         let status = match *err.kind() {
-            Kind::Parse(Parse::Method | Parse::Header(_) | Parse::Uri | Parse::Version) => {
+            Kind::Parse(Parse::Method | Parse::Header(_) | Parse::Uri | Parse::Version(_)) => {
                 StatusCode::BAD_REQUEST
             }
             Kind::Parse(Parse::TooLarge) => StatusCode::REQUEST_HEADER_FIELDS_TOO_LARGE,
@@ -1091,6 +1162,15 @@ impl Http1Transaction for Client {
                         trace!("Response.parse accepted HTTP/0.9 response");
 
                         (0, StatusCode::OK, None, Version::HTTP_09, 0)
+                    }
+                    Err(httparse::Error::Version) => {
+                        // httparse consumed the leading empty lines before
+                        // failing, so the status line starts at the first
+                        // non-empty line. The version is the first token on
+                        // that line.
+                        return Err(Parse::Version(crate::error::InvalidVersion::new(
+                            version_token_snippet(bytes, version_start_response(bytes)),
+                        )));
                     }
                     Err(e) => return Err(e.into()),
                 }
@@ -1775,6 +1855,79 @@ mod tests {
             on_informational: &mut None,
         };
         Server::parse(&mut raw, ctx).unwrap_err();
+    }
+
+    #[test]
+    fn test_parse_request_version_error_reports_received_token() {
+        let mut raw = BytesMut::from("GET / HTTP/3.0\r\nHost: hyper.rs\r\n\r\n");
+        let ctx = ParseContext {
+            cached_headers: &mut None,
+            req_method: &mut None,
+            h1_parser_config: Default::default(),
+            h1_max_headers: None,
+            h1_max_header_size: None,
+            preserve_header_case: false,
+            #[cfg(feature = "ffi")]
+            preserve_header_order: false,
+            h09_responses: false,
+            #[cfg(feature = "client")]
+            on_informational: &mut None,
+        };
+        let err = Server::parse(&mut raw, ctx).unwrap_err();
+        match err {
+            crate::error::Parse::Version(v) => {
+                assert_eq!(v.escaped(), "HTTP/3.0");
+            }
+            other => panic!("expected Parse::Version, got {other:?}"),
+        }
+    }
+
+    #[cfg(feature = "client")]
+    #[test]
+    fn test_parse_response_version_error_reports_received_token() {
+        let mut raw = BytesMut::from("HTTP/3.0 200 OK\r\n\r\n");
+        let ctx = ParseContext {
+            cached_headers: &mut None,
+            req_method: &mut Some(crate::Method::GET),
+            h1_parser_config: Default::default(),
+            h1_max_headers: None,
+            h1_max_header_size: None,
+            preserve_header_case: false,
+            #[cfg(feature = "ffi")]
+            preserve_header_order: false,
+            h09_responses: false,
+            on_informational: &mut None,
+        };
+        let err = Client::parse(&mut raw, ctx).unwrap_err();
+        match err {
+            crate::error::Parse::Version(v) => {
+                assert_eq!(v.escaped(), "HTTP/3.0");
+            }
+            other => panic!("expected Parse::Version, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_parse_version_error_display_includes_received_token() {
+        let mut raw = BytesMut::from("GET / HTTP/3.0\r\nHost: hyper.rs\r\n\r\n");
+        let ctx = ParseContext {
+            cached_headers: &mut None,
+            req_method: &mut None,
+            h1_parser_config: Default::default(),
+            h1_max_headers: None,
+            h1_max_header_size: None,
+            preserve_header_case: false,
+            #[cfg(feature = "ffi")]
+            preserve_header_order: false,
+            h09_responses: false,
+            #[cfg(feature = "client")]
+            on_informational: &mut None,
+        };
+        let err: crate::Error = Server::parse(&mut raw, ctx).unwrap_err().into();
+        assert_eq!(
+            err.to_string(),
+            "invalid HTTP version parsed (HTTP/3.0)"
+        );
     }
 
     const H09_RESPONSE: &str = "Baguettes are super delicious, don't you agree?";

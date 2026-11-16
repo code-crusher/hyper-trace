@@ -1206,7 +1206,7 @@ test! {
             \r\n\
             ",
         reply: "\
-            HEAT/1.1 200 OK\r\n\
+            HEAT/3.1 200 OK\r\n\
             \r\n\
             ",
 
@@ -1215,8 +1215,8 @@ test! {
             method: GET,
             url: "http://{addr}/err",
         },
-        // should get a Parse(Version) error
-        error: |err| err.is_parse(),
+        // should get a Parse(Version) error, including the received token
+        error: |err| err.is_parse() && err.to_string() == "invalid HTTP version parsed (HEAT/3.1)",
 
 }
 

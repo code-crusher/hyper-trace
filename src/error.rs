@@ -89,7 +89,10 @@ pub(super) enum Kind {
 pub(super) enum Parse {
     Method,
     #[cfg(feature = "http1")]
-    Version,
+    /// Contains a short, sanitized snippet of the version token that was
+    /// received, to aid in debugging. It is bounded to `MAX_VERSION_SNIPPET`
+    /// bytes and escaped for display.
+    Version(InvalidVersion),
     #[cfg(all(any(feature = "client", feature = "server"), feature = "http1"))]
     VersionH2,
     Uri,
@@ -103,6 +106,51 @@ pub(super) enum Parse {
     Status,
     #[cfg(all(any(feature = "client", feature = "server"), feature = "http1"))]
     Internal,
+}
+
+/// A short, sanitized snippet of the version token that was received where an
+/// HTTP version was expected.
+///
+/// The raw bytes are bounded to [`MAX_VERSION_SNIPPET`] bytes and escaped for
+/// display, so it is safe to include in error messages.
+#[cfg(feature = "http1")]
+#[derive(Debug, PartialEq, Eq)]
+pub(super) struct InvalidVersion(Box<[u8]>);
+
+/// The maximum number of bytes of the received version token to retain.
+#[cfg(feature = "http1")]
+pub(super) const MAX_VERSION_SNIPPET: usize = 16;
+
+#[cfg(feature = "http1")]
+impl InvalidVersion {
+    pub(super) fn new(bytes: &[u8]) -> Self {
+        InvalidVersion(Box::from(&bytes[..bytes.len().min(MAX_VERSION_SNIPPET)]))
+    }
+
+    /// Render the snippet as an escaped, printable ASCII string.
+    pub(crate) fn escaped(&self) -> String {
+        let mut s = String::with_capacity(self.0.len());
+        for &b in &self.0 {
+            match b {
+                0x20..=0x7e if b != b'\\' => s.push(b as char),
+                b'\\' => s.push_str("\\\\"),
+                _ => {
+                    let _ = std::fmt::Write::write_fmt(
+                        &mut s,
+                        format_args!("\\x{b:02x}"),
+                    );
+                }
+            }
+        }
+        s
+    }
+}
+
+#[cfg(feature = "http1")]
+impl fmt::Display for InvalidVersion {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.escaped())
+    }
 }
 
 #[derive(Debug)]
@@ -497,11 +545,11 @@ impl Error {
         }
     }
 
-    fn description(&self) -> &str {
+    fn description(&self) -> &'static str {
         match self.inner.kind {
             Kind::Parse(Parse::Method) => "invalid HTTP method parsed",
             #[cfg(feature = "http1")]
-            Kind::Parse(Parse::Version) => "invalid HTTP version parsed",
+            Kind::Parse(Parse::Version(_)) => "invalid HTTP version parsed",
             #[cfg(all(any(feature = "client", feature = "server"), feature = "http1"))]
             Kind::Parse(Parse::VersionH2) => "invalid HTTP version parsed (found HTTP2 preface)",
             Kind::Parse(Parse::Uri) => "invalid URI",
@@ -611,6 +659,11 @@ impl fmt::Debug for Error {
 
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        #[cfg(feature = "http1")]
+        if let Kind::Parse(Parse::Version(v)) = &self.inner.kind {
+            // Include the received version token, to aid in debugging.
+            return write!(f, "invalid HTTP version parsed ({v})");
+        }
         f.write_str(self.description())
     }
 }
@@ -659,7 +712,7 @@ impl From<httparse::Error> for Parse {
             | httparse::Error::Token => Parse::Header(Header::Token),
             httparse::Error::Status => Parse::Status,
             httparse::Error::TooManyHeaders => Parse::TooLarge,
-            httparse::Error::Version => Parse::Version,
+            httparse::Error::Version => Parse::Version(InvalidVersion::new(&[])),
         }
     }
 }
@@ -713,6 +766,34 @@ mod tests {
     #[test]
     fn error_size_of() {
         assert_eq!(mem::size_of::<Error>(), mem::size_of::<usize>());
+    }
+
+    #[cfg(all(feature = "http1", any(feature = "client", feature = "server")))]
+    #[test]
+    fn parse_version_display_includes_received_bytes() {
+        let err = Error::new(Kind::Parse(Parse::Version(InvalidVersion::new(b"HTTP/3.0"))));
+        assert_eq!(err.to_string(), "invalid HTTP version parsed (HTTP/3.0)");
+    }
+
+    #[cfg(all(feature = "http1", any(feature = "client", feature = "server")))]
+    #[test]
+    fn parse_version_snippet_is_bounded() {
+        let err = Error::new(Kind::Parse(Parse::Version(InvalidVersion::new(b"HTTP/3.0 and more bytes"))));
+        assert_eq!(
+            err.to_string(),
+            "invalid HTTP version parsed (HTTP/3.0 and mor)"
+        );
+    }
+
+    #[cfg(all(feature = "http1", any(feature = "client", feature = "server")))]
+    #[test]
+    fn parse_version_snippet_escapes_non_printable() {
+        let err = Error::new(Kind::Parse(Parse::Version(InvalidVersion::new(
+            b"HTTP/1.\r\n",
+        ))));
+        let s = err.to_string();
+        assert!(!s.contains('\r'), "raw carriage return leaked: {s:?}");
+        assert_eq!(s, "invalid HTTP version parsed (HTTP/1.\\x0d\\x0a)");
     }
 
     #[cfg(feature = "http2")]
