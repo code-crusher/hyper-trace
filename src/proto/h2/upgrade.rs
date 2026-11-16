@@ -13,6 +13,16 @@ use super::ping::Recorder;
 use super::SendBuf;
 use crate::rt::{Read, ReadBufCursor, Write};
 
+/// Split an upgraded stream into its read side (`H2Upgraded`) and a task that
+/// forwards the write side (`UpgradedSendStreamTask`).
+///
+/// The write side is bridged through a channel of `Cursor<Box<[u8]>>` buffers
+/// rather than reusing the original `SendStream<SendBuf<B>>` directly. This is
+/// deliberate: the upgraded tunnel must never write the request body's `B`
+/// chunks, and it must be possible to hand `SendStream<SendBuf<B>>` to the
+/// executor's own future without violating any layout or lifetime assumptions
+/// about `SendBuf<B>`. See #3500, which reported that an earlier
+/// `repr(transparent)`/`transmute`-based `Neutered<B>` approach was unsound.
 pub(super) fn pair<B>(
     send_stream: SendStream<SendBuf<B>>,
     recv_stream: RecvStream,
