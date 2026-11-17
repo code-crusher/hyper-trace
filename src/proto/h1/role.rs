@@ -26,7 +26,7 @@ use crate::proto::h1::{
 };
 #[cfg(feature = "client")]
 use crate::proto::RequestHead;
-use crate::proto::{BodyLength, MessageHead, RequestLine};
+use crate::proto::{request_target_has_curly_braces, BodyLength, MessageHead, RequestLine};
 
 pub(crate) const DEFAULT_MAX_HEADERS: usize = 100;
 const AVERAGE_HEADER_SIZE: usize = 30; // totally scientific
@@ -189,6 +189,11 @@ impl Http1Transaction for Server {
                     let uri = req.path.expect("httparse completed");
                     if uri.len() > MAX_URI_LEN {
                         return Err(Parse::UriTooLong);
+                    }
+                    if request_target_has_curly_braces(uri) {
+                        // `http::Uri` tolerates curly braces in the path, but they
+                        // are not valid there (RFC 3986, RFC 7230).
+                        return Err(Parse::Uri);
                     }
                     method =
                         Method::from_bytes(req.method.expect("httparse completed").as_bytes())?;
@@ -1775,6 +1780,73 @@ mod tests {
             on_informational: &mut None,
         };
         Server::parse(&mut raw, ctx).unwrap_err();
+    }
+
+    #[cfg(feature = "server")]
+    #[test]
+    fn test_parse_request_rejects_curly_braces_in_path() {
+        for uri in [
+            "/hello/{world}",
+            "/{",
+            "/}",
+            "/a/{b}/c?d=e",
+            "http://example.com/{path}",
+            "http://example.com/path/{param}?query=1",
+        ] {
+            let mut raw =
+                BytesMut::from(format!("GET {} HTTP/1.1\r\nHost: hyper.rs\r\n\r\n", uri).as_str());
+            let ctx = ParseContext {
+                cached_headers: &mut None,
+                req_method: &mut None,
+                h1_parser_config: Default::default(),
+                h1_max_headers: None,
+                h1_max_header_size: None,
+                preserve_header_case: false,
+                #[cfg(feature = "ffi")]
+                preserve_header_order: false,
+                h09_responses: false,
+                #[cfg(feature = "client")]
+                on_informational: &mut None,
+            };
+            let err = Server::parse(&mut raw, ctx).unwrap_err();
+            assert!(
+                matches!(err, crate::error::Parse::Uri),
+                "uri {:?} should be rejected with Parse::Uri, got {:?}",
+                uri,
+                err,
+            );
+        }
+    }
+
+    #[cfg(feature = "server")]
+    #[test]
+    fn test_parse_request_allows_curly_braces_outside_path() {
+        for uri in [
+            // percent-encoded braces are fine
+            "/%7Bworld%7D",
+            "/%7B",
+            // braces in the query are tolerated
+            "/path?query={value}",
+            "/?{",
+        ] {
+            let mut raw =
+                BytesMut::from(format!("GET {} HTTP/1.1\r\nHost: hyper.rs\r\n\r\n", uri).as_str());
+            let ctx = ParseContext {
+                cached_headers: &mut None,
+                req_method: &mut None,
+                h1_parser_config: Default::default(),
+                h1_max_headers: None,
+                h1_max_header_size: None,
+                preserve_header_case: false,
+                #[cfg(feature = "ffi")]
+                preserve_header_order: false,
+                h09_responses: false,
+                #[cfg(feature = "client")]
+                on_informational: &mut None,
+            };
+            Server::parse(&mut raw, ctx)
+                .unwrap_or_else(|err| panic!("uri {:?} should be accepted, got {:?}", uri, err));
+        }
     }
 
     const H09_RESPONSE: &str = "Baguettes are super delicious, don't you agree?";

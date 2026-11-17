@@ -19,7 +19,7 @@ use crate::common::time::Time;
 use crate::ext::Protocol;
 use crate::headers;
 use crate::proto::h2::ping::Recorder;
-use crate::proto::Dispatched;
+use crate::proto::{request_target_has_curly_braces, Dispatched};
 use crate::rt::bounds::{Http2ServerConnExec, Http2UpgradedExec};
 use crate::rt::{Read, Write};
 use crate::service::HttpService;
@@ -263,6 +263,22 @@ where
                 match ready!(self.conn.poll_accept(cx)) {
                     Some(Ok((req, mut respond))) => {
                         trace!("incoming request");
+
+                        // `http::Uri` tolerates curly braces in the path, but they are
+                        // not valid there (RFC 3986, RFC 7230). Reject the request
+                        // instead of passing it along to the service.
+                        if request_target_has_curly_braces(req.uri().path()) {
+                            trace!("rejecting request with curly braces in path");
+                            let res = Response::builder()
+                                .status(::http::StatusCode::BAD_REQUEST)
+                                .body(())
+                                .expect("valid response");
+                            if respond.send_response(res, true).is_err() {
+                                trace!("failed to send 400 response");
+                            }
+                            continue;
+                        }
+
                         let content_length = headers::content_length_parse_all(req.headers());
                         let ping = self
                             .ping

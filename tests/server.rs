@@ -1202,6 +1202,73 @@ fn http_11_uri_too_long() {
     assert_eq!(s(&buf[..expected.len()]), expected);
 }
 
+#[test]
+fn http_11_uri_with_curly_braces_in_path_is_rejected() {
+    let server = serve();
+
+    let mut req = connect(server.addr());
+    req.write_all(
+        b"\
+        GET /hello/{world} HTTP/1.1\r\n\
+        Host: example.domain\r\n\
+        \r\n\
+    ",
+    )
+    .unwrap();
+
+    let expected = "HTTP/1.1 400 Bad Request\r\nconnection: close\r\ncontent-length: 0\r\n";
+    let mut buf = [0; 256];
+    let n = req.read(&mut buf).unwrap();
+    assert!(n >= expected.len(), "read: {:?} >= {:?}", n, expected.len());
+    assert_eq!(s(&buf[..expected.len()]), expected);
+}
+
+#[test]
+fn http_11_uri_with_braces_in_absolute_form_is_rejected() {
+    let server = serve();
+
+    let mut req = connect(server.addr());
+    req.write_all(
+        b"\
+        GET http://example.com/{path} HTTP/1.1\r\n\
+        Host: example.com\r\n\
+        \r\n\
+    ",
+    )
+    .unwrap();
+
+    let expected = "HTTP/1.1 400 Bad Request\r\nconnection: close\r\ncontent-length: 0\r\n";
+    let mut buf = [0; 256];
+    let n = req.read(&mut buf).unwrap();
+    assert!(n >= expected.len(), "read: {:?} >= {:?}", n, expected.len());
+    assert_eq!(s(&buf[..expected.len()]), expected);
+}
+
+#[test]
+fn http_11_uri_with_curly_braces_in_query_is_accepted() {
+    let server = serve();
+    server.reply().body("hello");
+
+    let mut req = connect(server.addr());
+    req.write_all(
+        b"\
+        GET /hello?world={value} HTTP/1.1\r\n\
+        Host: example.domain\r\n\
+        \r\n\
+    ",
+    )
+    .unwrap();
+
+    let expected = "hello";
+    let resp =
+        read_until(&mut req, |buf| buf.ends_with(expected.as_bytes())).expect("reading response");
+    assert!(
+        s(&resp).starts_with("HTTP/1.1 200 OK\r\n"),
+        "got: {:?}",
+        s(&resp)
+    );
+}
+
 #[tokio::test]
 async fn disable_keep_alive_mid_request() {
     let (client_io, server_io, _) = setup_duplex_test_server();
@@ -2952,6 +3019,88 @@ fn http1_only() {
         client.get(uri)
     })
     .unwrap_err();
+}
+
+#[tokio::test]
+async fn http2_uri_with_curly_braces_in_path_is_rejected() {
+    // The `http` crate tolerates curly braces in the path, so construct the
+    // request URI via `http::Uri` and send it raw over a hand-rolled h2
+    // client connection. The server must reject the request with 400 and
+    // must not call the service.
+    let server = serve_opts().http2().serve();
+
+    let addr = server.addr();
+    let addr_str = format!("http://{}", addr);
+    let uri: Uri = format!("{}/hello/{{world}}", addr_str)
+        .parse()
+        .expect("uri");
+
+    assert_eq!(uri.path(), "/hello/{world}");
+
+    let conn = connect_async(*addr).await;
+    let (h2, connection) = h2::client::handshake(conn).await.unwrap();
+    tokio::spawn(async move {
+        connection.await.unwrap();
+    });
+    let mut h2 = h2.ready().await.unwrap();
+
+    let request = Request::builder()
+        .uri(uri)
+        .method(Method::GET)
+        .body(())
+        .expect("request");
+    let (response, _send_stream) = h2.send_request(request, true).expect("send_request");
+    let response = response.await.expect("response");
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+    // The service must not have been called: no chunks queued, no End marker.
+    assert!(server.msg_rx.try_recv().is_err());
+
+    let _ = server;
+}
+
+#[tokio::test]
+async fn http2_uri_with_curly_braces_in_query_is_accepted() {
+    let server = serve_opts().http2().serve();
+
+    let addr = server.addr();
+    let addr_str = format!("http://{}", addr);
+    server.reply().body("hello");
+
+    let uri: Uri = format!("{}/hello?world={{value}}", addr_str)
+        .parse()
+        .expect("uri");
+
+    assert_eq!(uri.query(), Some("world={value}"));
+
+    let conn = connect_async(*addr).await;
+    let (h2, connection) = h2::client::handshake(conn).await.unwrap();
+    tokio::spawn(async move {
+        connection.await.unwrap();
+    });
+    let mut h2 = h2.ready().await.unwrap();
+
+    let request = Request::builder()
+        .uri(uri)
+        .method(Method::GET)
+        .body(())
+        .expect("request");
+    let (response, _send_stream) = h2.send_request(request, true).expect("send_request");
+    let response = response.await.expect("response");
+    assert_eq!(response.status(), StatusCode::OK);
+
+    // consume the body (a GET without a body produces no chunks, but wait for EOF)
+    let mut body = response.into_body();
+    while let Some(chunk) = body.data().await {
+        let chunk = chunk.expect("body chunk");
+        if chunk.is_empty() {
+            break;
+        }
+        let _ = body.flow_control().release_capacity(chunk.len());
+    }
+
+    // the service was called
+    assert_eq!(server.body(), b"");
 }
 
 #[tokio::test]

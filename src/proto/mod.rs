@@ -16,6 +16,28 @@ cfg_feature! {
 #[cfg(feature = "http2")]
 pub(crate) mod h2;
 
+/// Check if the path portion of a request target contains a `{` or `}`.
+///
+/// Curly braces are not allowed in the path of a URI by the HTTP specifications
+/// (RFC 3986, RFC 7230), and no mainstream browser accepts them in practice. However, the
+/// `http` crate tolerates them for historical reasons, so hyper validates the target itself
+/// when handling requests on the server side.
+///
+/// The scan stops at the first `?` or `#`, so only the path portion is checked; braces in
+/// the query are tolerated, and a fragment is never considered.
+#[cfg(any(feature = "http1", feature = "http2"))]
+pub(crate) fn request_target_has_curly_braces(target: &str) -> bool {
+    for &byte in target.as_bytes() {
+        match byte {
+            b'?' | b'#' => return false,
+            b'{' | b'}' => return true,
+            _ => (),
+        }
+    }
+
+    false
+}
+
 /// An Incoming Message head. Includes request/status line, and headers.
 #[cfg(feature = "http1")]
 #[derive(Debug, Default)]
