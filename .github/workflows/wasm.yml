@@ -1,0 +1,27 @@
+name: wasm
+# Checking that hyper supports wasm targets, see issue #3651.
+# Note: hyper-util's `tokio` feature used to be broken on wasm (it enabled
+# `tokio/net`, which pulls in `mio`); that is fixed upstream, and this job
+# keeps hyper itself from regressing on wasm targets.
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+jobs:
+  build:
+    name: Build for wasm32
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Check
+        run: cargo check --target wasm32-unknown-unknown --features full
