@@ -172,6 +172,14 @@ pub enum hyper_task_return_type {
     HYPER_TASK_BUF,
 }
 
+/// Ties a task's output type to the C API enum describing it.
+///
+/// # Safety
+///
+/// `as_task_type` must return the variant that corresponds to `Self`. The C
+/// API hands the value out as a `void *` alongside this tag, and C callers are
+/// expected to cast it back to the pointer type named by the tag, so a wrong
+/// tag would make them reinterpret the value as the wrong type.
 pub(crate) unsafe trait AsTaskType {
     fn as_task_type(&self) -> hyper_task_return_type;
 }

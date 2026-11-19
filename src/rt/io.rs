@@ -275,12 +275,26 @@ impl<'data> ReadBuf<'data> {
         }
     }
 
+    /// Mark `n` bytes as initialized, without changing the filled cursor.
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure the first `n` bytes of the buffer have actually
+    /// been initialized. Since this only grows `init`, it must never be used
+    /// to de-initialize bytes.
     #[inline]
     #[cfg(all(any(feature = "client", feature = "server"), feature = "http2"))]
     pub(crate) unsafe fn set_init(&mut self, n: usize) {
         self.init = self.init.max(n);
     }
 
+    /// Move the filled cursor to `n` bytes, marking them as initialized too.
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure the first `n` bytes of the buffer have actually
+    /// been initialized. Since this only grows `filled`, it must never be used
+    /// to de-initialize bytes.
     #[inline]
     #[cfg(all(any(feature = "client", feature = "server"), feature = "http2"))]
     pub(crate) unsafe fn set_filled(&mut self, n: usize) {

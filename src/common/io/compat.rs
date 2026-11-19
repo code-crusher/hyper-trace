@@ -110,6 +110,10 @@ where
         cx: &mut Context<'_>,
         mut buf: crate::rt::ReadBufCursor<'_>,
     ) -> Poll<Result<(), std::io::Error>> {
+        // SAFETY: `buf.as_mut()` is only valid to call if we don't
+        // de-initialize bytes, which `ReadBuf::uninit` and the wrapped
+        // `poll_read` both uphold: the unfilled region is what the callee
+        // writes into, and tokio tracks it as uninitialized.
         let n = unsafe {
             let mut tbuf = tokio::io::ReadBuf::uninit(buf.as_mut());
             match tokio::io::AsyncRead::poll_read(self.p(), cx, &mut tbuf) {
@@ -118,6 +122,8 @@ where
             }
         };
 
+        // SAFETY: the wrapped `poll_read` returned `Ready(Ok(()))` and reported
+        // `n` bytes filled, so exactly `n` bytes were initialized.
         unsafe {
             buf.advance(n);
         }

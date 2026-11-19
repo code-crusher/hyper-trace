@@ -556,6 +556,14 @@ impl Default for hyper_headers {
     }
 }
 
+/// Reads a header name and value out of the pointers given by the C API.
+///
+/// # Safety
+///
+/// For each of the two `(ptr, len)` pairs, `ptr` must be non-null and valid
+/// for reads of `len` bytes for the duration of this call. The bytes do not
+/// need to be valid UTF-8; they are validated as a header name and value
+/// below, and an error is returned if they are not valid.
 unsafe fn raw_name_value(
     name: *const u8,
     name_len: size_t,

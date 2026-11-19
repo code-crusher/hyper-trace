@@ -13,6 +13,23 @@ use super::ping::Recorder;
 use super::SendBuf;
 use crate::rt::{Read, ReadBufCursor, Write};
 
+/// Splits an upgraded HTTP/2 stream into a readable [`H2Upgraded`] and the
+/// [`UpgradedSendStreamTask`] that drives its write side.
+///
+/// # Invariants
+///
+/// Once a stream has been upgraded, the tunnel must never send data from the
+/// request body type `B`: the body was consumed by the protocol layer before
+/// the upgrade happened. This is upheld by keeping the `h2` `SendStream` in
+/// this task and only ever handing it `SendBuf::Cursor` (bytes written to the
+/// upgraded tunnel) or `SendBuf::None` (end of stream), so `SendBuf::Buf(B)`
+/// is unreachable on this path.
+///
+/// Because of that, the `SendStream<SendBuf<B>>` does not need to be
+/// transmuted into a differently-typed `SendStream`. An earlier design did so
+/// with a `repr(transparent)` `Neutered<B>` wrapper over an uninhabited enum;
+/// that relied on layout guarantees the compiler does not make (#3500), and
+/// was replaced by this task-and-channel bridge in #3967.
 pub(super) fn pair<B>(
     send_stream: SendStream<SendBuf<B>>,
     recv_stream: RecvStream,
@@ -282,5 +299,115 @@ fn h2_to_io_error(e: h2::Error) -> std::io::Error {
             .expect("h2 error reported io cause without an underlying io error")
     } else {
         std::io::Error::new(std::io::ErrorKind::Other, e)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A `Buf` that panics when used.
+    ///
+    /// An upgraded tunnel must never send the request body type `B`, only the
+    /// bytes written to the [`H2Upgraded`] handle. If `UpgradedSendStreamTask`
+    /// ever handed the `SendStream` a `SendBuf::Buf(_)`, `h2` would call into
+    /// this type and the test would fail.
+    struct PanicBuf;
+
+    impl Buf for PanicBuf {
+        fn remaining(&self) -> usize {
+            panic!("upgraded stream tried to send the request body type")
+        }
+
+        fn chunk(&self) -> &[u8] {
+            panic!("upgraded stream tried to send the request body type")
+        }
+
+        fn advance(&mut self, _cnt: usize) {
+            panic!("upgraded stream tried to send the request body type")
+        }
+    }
+
+    /// Writes all of `buf` to the upgraded stream, driving it to completion.
+    async fn write_all(up: &mut H2Upgraded, mut buf: &[u8]) -> std::io::Result<()> {
+        while !buf.is_empty() {
+            let n =
+                futures_util::future::poll_fn(|cx| Pin::new(&mut *up).poll_write(cx, buf)).await?;
+            assert!(n > 0, "poll_write made no progress");
+            buf = &buf[n..];
+        }
+        Ok(())
+    }
+
+    #[cfg(not(miri))]
+    #[tokio::test]
+    async fn upgraded_send_stream_only_forwards_tunnel_bytes() {
+        let (client_io, server_io) = tokio::io::duplex(1024);
+
+        let (mut send_req, client_conn) = h2::client::Builder::new()
+            .handshake::<_, SendBuf<PanicBuf>>(client_io)
+            .await
+            .expect("client handshake");
+        tokio::spawn(async move {
+            let _ = client_conn.await;
+        });
+
+        let mut server_conn = h2::server::Builder::new()
+            .handshake::<_, SendBuf<PanicBuf>>(server_io)
+            .await
+            .expect("server handshake");
+
+        let request = http::Request::connect("localhost")
+            .body(())
+            .expect("CONNECT request");
+        let (response_fut, _client_send) = send_req.send_request(request, false).expect("send");
+
+        let (request, mut respond) = server_conn.accept().await.expect("accept").expect("stream");
+        assert_eq!(request.method(), http::Method::CONNECT);
+
+        // Keep the server connection driven while the tunnel is open.
+        tokio::spawn(async move {
+            while let Some(res) = server_conn.accept().await {
+                if res.is_err() {
+                    break;
+                }
+            }
+        });
+
+        let response = http::Response::builder()
+            .status(http::StatusCode::OK)
+            .body(())
+            .expect("response");
+        let send_stream = respond
+            .send_response(response, false)
+            .expect("send response");
+
+        let (mut h2_up, task) = pair(
+            send_stream,
+            request.into_body(),
+            crate::proto::h2::ping::disabled(),
+        );
+        tokio::spawn(task);
+
+        write_all(&mut h2_up, b"Bread?")
+            .await
+            .expect("write tunnel bytes");
+        futures_util::future::poll_fn(|cx| Pin::new(&mut h2_up).poll_shutdown(cx))
+            .await
+            .expect("shutdown");
+
+        let response = response_fut.await.expect("response");
+        assert_eq!(response.status(), http::StatusCode::OK);
+
+        let mut body = response.into_body();
+        let bytes = body.data().await.expect("data").expect("body chunk");
+        assert_eq!(&bytes[..], b"Bread?");
+        let _ = body.flow_control().release_capacity(bytes.len());
+
+        // The tunnel wrote nothing else; the stream is then closed with an
+        // empty DATA frame carrying END_STREAM, or by returning `None`.
+        if let Some(chunk) = body.data().await {
+            assert!(chunk.expect("body chunk").is_empty());
+        }
     }
 }

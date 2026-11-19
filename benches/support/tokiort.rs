@@ -112,6 +112,10 @@ where
         cx: &mut Context<'_>,
         mut buf: hyper::rt::ReadBufCursor<'_>,
     ) -> Poll<Result<(), std::io::Error>> {
+        // SAFETY: `buf.as_mut()` is only valid to call if we don't
+        // de-initialize bytes, which `ReadBuf::uninit` and the wrapped
+        // `poll_read` both uphold: the unfilled region is what the callee
+        // writes into, and tokio tracks it as uninitialized.
         let n = unsafe {
             let mut tbuf = tokio::io::ReadBuf::uninit(buf.as_mut());
             match tokio::io::AsyncRead::poll_read(self.project().inner, cx, &mut tbuf) {
@@ -120,6 +124,8 @@ where
             }
         };
 
+        // SAFETY: the wrapped `poll_read` returned `Ready(Ok(()))` and reported
+        // `n` bytes filled, so exactly `n` bytes were initialized.
         unsafe {
             buf.advance(n);
         }
@@ -174,6 +180,11 @@ where
     ) -> Poll<Result<(), std::io::Error>> {
         //let init = tbuf.initialized().len();
         let filled = tbuf.filled().len();
+        // SAFETY: `tbuf.unfilled_mut()` requires that already-initialized bytes
+        // are not de-initialized. The `hyper::rt::ReadBuf` built from it starts
+        // empty and only ever grows its filled cursor, so the region before it
+        // is left untouched, and the wrapped `poll_read` only writes to the
+        // unfilled part it is given.
         let sub_filled = unsafe {
             let mut buf = hyper::rt::ReadBuf::uninit(tbuf.unfilled_mut());
 
@@ -186,6 +197,10 @@ where
         let n_filled = filled + sub_filled;
         // At least sub_filled bytes had to have been initialized.
         let n_init = sub_filled;
+        // SAFETY: the wrapped `poll_read` reported `sub_filled` initialized
+        // bytes, so `assume_init(sub_filled)` is valid; `set_filled` is then
+        // called with the previous filled length plus those newly-initialized
+        // bytes, which stays within the initialized region.
         unsafe {
             tbuf.assume_init(n_init);
             tbuf.set_filled(n_filled);
