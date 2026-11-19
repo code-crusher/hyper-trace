@@ -547,3 +547,84 @@ fn pin_as_deref_mut<P: DerefMut>(pin: Pin<&mut Pin<P>>) -> Pin<&mut P::Target> {
     // giving out the &mut Pin<P> in the process. See Pin::as_deref_mut() for more detail.
     unsafe { pin.get_unchecked_mut() }.as_mut()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn read_buf_cursor_initialize_unfilled_from_uninit() {
+        // Regression test for https://github.com/hyperium/hyper/issues/3509:
+        // a `Read` implementation must be able to get a writable (initialized)
+        // slice of the unfilled region without any unsafe code.
+        let mut backing = [0u8; 8];
+        let mut buf = ReadBuf::uninit(
+            // SAFETY: `MaybeUninit` has the same layout as `u8`.
+            unsafe { &mut *std::ptr::addr_of_mut!(backing).cast::<[MaybeUninit<u8>; 8]>() },
+        );
+
+        let mut cursor = buf.unfilled();
+        let slice = cursor.initialize_unfilled();
+        assert_eq!(slice.len(), 8);
+
+        slice.copy_from_slice(b"whatever");
+
+        assert_eq!(buf.filled(), b"");
+        assert_eq!(buf.init_len(), 8);
+
+        buf.unfilled().put_slice(b"hi");
+        assert_eq!(buf.filled(), b"hi");
+        assert_eq!(buf.init_len(), 8);
+    }
+
+    #[test]
+    fn read_buf_cursor_initialize_unfilled_to_partial() {
+        let mut backing = [0u8; 8];
+        let mut buf = ReadBuf::uninit(
+            // SAFETY: `MaybeUninit` has the same layout as `u8`.
+            unsafe { &mut *std::ptr::addr_of_mut!(backing).cast::<[MaybeUninit<u8>; 8]>() },
+        );
+
+        {
+            let mut cursor = buf.unfilled();
+            assert_eq!(cursor.initialize_unfilled_to(3).len(), 3);
+            cursor.put_slice(b"abc");
+            assert_eq!(cursor.remaining(), 5);
+        }
+
+        assert_eq!(buf.filled(), b"abc");
+        assert_eq!(buf.init_len(), 3);
+    }
+
+    #[test]
+    fn read_buf_cursor_initialize_unfilled_tracks_init() {
+        let mut backing = [0; 8];
+        let mut buf = ReadBuf::new(&mut backing);
+
+        // The whole buffer starts out initialized.
+        assert_eq!(buf.unfilled().initialize_unfilled().len(), 8);
+
+        buf.unfilled().put_slice(b"abc");
+
+        {
+            let mut cursor = buf.unfilled();
+            // Filling only part of it must not de-initialize the rest.
+            let slice = cursor.initialize_unfilled_to(2);
+            assert_eq!(slice.len(), 2);
+            slice[0] = b'd';
+            slice[1] = b'e';
+        }
+
+        assert_eq!(buf.filled(), b"abc");
+        assert_eq!(buf.init_len(), 8);
+    }
+
+    #[test]
+    #[should_panic(expected = "n overflows remaining")]
+    fn read_buf_cursor_initialize_unfilled_to_panics_when_too_big() {
+        let mut backing = [0u8; 8];
+        let mut buf = ReadBuf::new(&mut backing);
+        buf.unfilled().put_slice(b"abc");
+        buf.unfilled().initialize_unfilled_to(6);
+    }
+}
