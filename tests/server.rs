@@ -3495,6 +3495,159 @@ fn http1_trailer_fields_allowed_with_multiple_te_headers() {
     assert_eq!(body, expected_body);
 }
 
+// A peer that connects but never sends data must not hold the connection open
+// indefinitely while the server is detecting the protocol (h1 vs h2). The
+// `auto` builder in hyper-util performs that detection before handing the
+// connection to the per-protocol machinery, and it relies on the h1
+// `header_read_timeout` to bound it (see issue #3962). These tests check
+// hyper's side of that contract: the timeout fires while no request bytes have
+// arrived, whether the peer is silent or trickling bytes of an h2 preface.
+#[tokio::test]
+async fn header_read_timeout_bounds_silent_peer() {
+    let (listener, addr) = setup_tcp_listener();
+
+    let _client = connect_async(addr).await;
+
+    let (socket, _) = listener.accept().await.expect("accept");
+    let socket = TokioIo::new(socket);
+
+    let conn = http1::Builder::new()
+        .timer(TokioTimer)
+        .header_read_timeout(Duration::from_millis(300))
+        .serve_connection(socket, unreachable_service());
+
+    let err = tokio::time::timeout(Duration::from_secs(5), conn)
+        .await
+        .expect("a silent peer must not hold the connection open")
+        .expect_err("header read timeout");
+    assert!(err.is_timeout(), "expected timeout, got {:?}", err);
+}
+
+#[tokio::test]
+async fn header_read_timeout_bounds_trickling_peer() {
+    let (listener, addr) = setup_tcp_listener();
+
+    let mut client = connect_async(addr).await;
+    client
+        .write_all(b"PRI * HTTP/2.0\r\n")
+        .await
+        .expect("partial preface");
+    // and then the peer stalls forever
+
+    let (socket, _) = listener.accept().await.expect("accept");
+    let socket = TokioIo::new(socket);
+
+    let conn = http1::Builder::new()
+        .timer(TokioTimer)
+        .header_read_timeout(Duration::from_millis(300))
+        .serve_connection(socket, unreachable_service());
+
+    // The connection must resolve; the partial preface is rejected as a
+    // parse error (`PRI * HTTP/2.0\r\n` is not a valid request line), which
+    // closes the connection rather than waiting for more bytes.
+    let err = tokio::time::timeout(Duration::from_secs(5), conn)
+        .await
+        .expect("a trickling peer must not hold the connection open")
+        .expect_err("partial request line");
+    assert!(err.is_parse(), "expected parse error, got {:?}", err);
+}
+
+// Serving with the h1 builder while the peer speaks h2 must surface an error
+// that `Error::is_parse_version_h2` identifies, and `into_parts` must hand
+// back the IO with the preface still buffered. That is the contract
+// hyper-util's `auto` builder relies on to switch the connection to h2 while
+// keeping the h1 `header_read_timeout` in force during the detection window
+// (see issue #3962).
+#[tokio::test]
+async fn h2_preface_over_h1_connection_is_recoverable() {
+    let (listener, addr) = setup_tcp_listener();
+
+    let mut client = connect_async(addr).await;
+    client
+        .write_all(b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n")
+        .await
+        .expect("h2 preface");
+
+    let (socket, _) = listener.accept().await.expect("accept");
+    let socket = TokioIo::new(socket);
+
+    let mut conn = http1::Builder::new()
+        .timer(TokioTimer)
+        .header_read_timeout(Duration::from_millis(300))
+        .serve_connection(socket, unreachable_service());
+
+    // The pattern `auto` uses: poll the connection; if the error says the
+    // bytes were the h2 preface, take the IO back out and hand it to the
+    // h2 builder.
+    let err = futures_util::future::poll_fn(|cx| conn.poll_without_shutdown(cx))
+        .await
+        .expect_err("h2 preface over h1 errors");
+    assert!(
+        err.is_parse_version_h2(),
+        "expected version-h2 error, got {:?}",
+        err
+    );
+
+    // The IO must be recoverable with the preface buffered, so the caller can
+    // hand it to the h2 builder. If the preface were consumed and discarded,
+    // the h2 handshake could not complete.
+    let parts = conn.into_parts();
+    assert_eq!(
+        &*parts.read_buf,
+        b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n",
+        "into_parts must preserve the buffered preface"
+    );
+    let _ = client;
+}
+
+// The same contract must hold for the upgradeable flavor, since `auto`'s
+// `serve_connection_with_upgrades` drives the detection through it: after the
+// version-h2 error the connection future has resolved with `Err`, and the IO
+// must still be recoverable for the switch to h2.
+#[tokio::test]
+async fn h2_preface_over_h1_upgradeable_connection_is_recoverable() {
+    let (listener, addr) = setup_tcp_listener();
+
+    let mut client = connect_async(addr).await;
+    client
+        .write_all(b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n")
+        .await
+        .expect("h2 preface");
+
+    let (socket, _) = listener.accept().await.expect("accept");
+    let socket = TokioIo::new(socket);
+
+    let mut conn = http1::Builder::new()
+        .timer(TokioTimer)
+        .header_read_timeout(Duration::from_millis(300))
+        .serve_connection(socket, unreachable_service())
+        .with_upgrades();
+
+    // Drive it the way `auto` would: poll, see the version-h2 error, then
+    // take the IO back out for the h2 builder.
+    let err = futures_util::future::poll_fn(|cx| Pin::new(&mut conn).poll(cx))
+        .await
+        .expect_err("h2 preface over h1 errors");
+    assert!(
+        err.is_parse_version_h2(),
+        "expected version-h2 error, got {:?}",
+        err
+    );
+
+    // After the error, `into_parts` must still hand back the IO with the
+    // preface buffered (`UpgradeableConnection::into_parts` returns `None`
+    // only if the connection was upgraded, which an error precludes).
+    let parts = conn
+        .into_parts()
+        .expect("connection errored, so it was not upgraded");
+    assert_eq!(
+        &*parts.read_buf,
+        b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n",
+        "into_parts must preserve the buffered preface"
+    );
+    let _ = client;
+}
+
 #[test]
 fn http1_trailer_recv_fields() {
     let server = serve();
