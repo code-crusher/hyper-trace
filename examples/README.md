@@ -32,6 +32,8 @@ futures-util = { version = "0.3", default-features = false }
 
 * [`client_json`](client_json.rs) - A simple program that GETs some json, reads the body asynchronously, parses it with serde and outputs the result.
 
+* [`client_proxy`](client_proxy.rs) - A client that tunnels a `CONNECT` request through an HTTP proxy, and then sends a request over the tunnel.
+
 ### Servers
 
 * [`hello`](hello.rs) - A simple server that returns "Hello World!".

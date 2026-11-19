@@ -223,6 +223,11 @@ path = "examples/client_json.rs"
 required-features = ["full"]
 
 [[example]]
+name = "client_proxy"
+path = "examples/client_proxy.rs"
+required-features = ["full"]
+
+[[example]]
 name = "echo"
 path = "examples/echo.rs"
 required-features = ["full"]
