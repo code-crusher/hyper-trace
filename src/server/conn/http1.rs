@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use crate::rt::{Read, Write};
 use crate::upgrade::Upgraded;
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use futures_core::ready;
 use httparse::ParserConfig;
 
@@ -45,6 +45,90 @@ pin_project_lite::pin_project! {
     }
 }
 
+/// A provider of buffers for an HTTP/1 connection.
+///
+/// By default, a connection allocates and keeps its read and write buffers for
+/// as long as the connection lives, even while it sits idle between requests.
+/// With a provider, the connection borrows buffers while a message is being
+/// read or written, and gives them back when it becomes idle. This lets an
+/// application pool and reuse buffers across connections, so that idle
+/// keep-alive connections hold no buffers at all.
+///
+/// Implementations are called from the connection task, and so should be
+/// cheap. A simple pool can be built with a `Mutex<Vec<_>>` of buffers.
+///
+/// # Example
+///
+/// ```
+/// # use bytes::BytesMut;
+/// # use hyper::server::conn::http1::BufProvider;
+/// # use std::sync::{Arc, Mutex};
+/// #[derive(Default)]
+/// struct Pool {
+///     read: Mutex<Vec<BytesMut>>,
+///     write: Mutex<Vec<Vec<u8>>>,
+/// }
+///
+/// impl BufProvider for Pool {
+///     fn take_read(&self, min: usize) -> BytesMut {
+///         let mut buf = self.read.lock().unwrap().pop().unwrap_or_default();
+///         buf.reserve(min);
+///         buf
+///     }
+///     fn give_read(&self, buf: BytesMut) {
+///         self.read.lock().unwrap().push(buf);
+///     }
+///     fn take_write(&self) -> Vec<u8> {
+///         self.write.lock().unwrap().pop().unwrap_or_default()
+///     }
+///     fn give_write(&self, buf: Vec<u8>) {
+///         self.write.lock().unwrap().push(buf);
+///     }
+/// }
+/// ```
+///
+/// Then set it on the [`Builder`]:
+///
+/// ```
+/// # use hyper::server::conn::http1::{Builder, BufProvider};
+/// # use std::sync::Arc;
+/// # #[derive(Default)]
+/// # struct Pool;
+/// # impl BufProvider for Pool {
+/// #     fn take_read(&self, _min: usize) -> bytes::BytesMut { unimplemented!() }
+/// #     fn give_read(&self, _buf: bytes::BytesMut) {}
+/// #     fn take_write(&self) -> Vec<u8> { unimplemented!() }
+/// #     fn give_write(&self, _buf: Vec<u8>) {}
+/// # }
+/// let mut http = Builder::new();
+/// http.buffer_provider(Arc::new(Pool::default()));
+/// ```
+pub trait BufProvider: Send + Sync + 'static {
+    /// Take a buffer to read a message into.
+    ///
+    /// The buffer should have room for at least `min` bytes if possible. The
+    /// connection always uses the returned buffer as-is; a buffer smaller
+    /// than `min` is grown as needed, but reusing a large enough buffer avoids
+    /// that allocation.
+    fn take_read(&self, min: usize) -> BytesMut;
+
+    /// Give back a read buffer that the connection no longer needs.
+    ///
+    /// The buffer is always empty.
+    fn give_read(&self, buf: BytesMut);
+
+    /// Take a buffer to encode a message head into.
+    ///
+    /// With the flatten write strategy, this buffer also holds message body
+    /// bytes.
+    fn take_write(&self) -> Vec<u8>;
+
+    /// Give back a write buffer whose bytes have all been written.
+    ///
+    /// The buffer is always empty.
+    fn give_write(&self, buf: Vec<u8>);
+}
+
 /// A configuration builder for HTTP/1 server connections.
 ///
 /// **Note**: The default values of options are *not considered stable*. They
@@ -68,7 +152,7 @@ pin_project_lite::pin_project! {
 ///
 /// Use [`Builder::serve_connection`](struct.Builder.html#method.serve_connection)
 /// to bind the built connection to a service.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct Builder {
     h1_parser_config: ParserConfig,
     timer: Time,
@@ -83,6 +167,7 @@ pub struct Builder {
     max_buf_size: Option<usize>,
     pipeline_flush: bool,
     date_header: bool,
+    buffer_provider: Option<Arc<dyn BufProvider>>,
 }
 
 /// Deconstructed parts of a `Connection`.
@@ -238,6 +323,29 @@ where
 
 // ===== impl Builder =====
 
+impl fmt::Debug for Builder {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // The buffer provider is a trait object without a `Debug` bound, so
+        // only report whether one is configured.
+        f.debug_struct("Builder")
+            .field("h1_parser_config", &self.h1_parser_config)
+            .field("timer", &self.timer)
+            .field("h1_half_close", &self.h1_half_close)
+            .field("h1_keep_alive", &self.h1_keep_alive)
+            .field("h1_title_case_headers", &self.h1_title_case_headers)
+            .field("h1_preserve_header_case", &self.h1_preserve_header_case)
+            .field("h1_max_headers", &self.h1_max_headers)
+            .field("h1_max_header_size", &self.h1_max_header_size)
+            .field("h1_header_read_timeout", &self.h1_header_read_timeout)
+            .field("h1_writev", &self.h1_writev)
+            .field("max_buf_size", &self.max_buf_size)
+            .field("pipeline_flush", &self.pipeline_flush)
+            .field("date_header", &self.date_header)
+            .field("buffer_provider", &self.buffer_provider.is_some())
+            .finish()
+    }
+}
+
 impl Builder {
     /// Create a new connection builder.
     pub fn new() -> Self {
@@ -255,6 +363,7 @@ impl Builder {
             max_buf_size: None,
             pipeline_flush: false,
             date_header: true,
+            buffer_provider: None,
         }
     }
     /// Set whether HTTP/1 connections should support half-closures.
@@ -434,6 +543,27 @@ impl Builder {
         self
     }
 
+    /// Set a provider of buffers for connections built by this builder.
+    ///
+    /// When set, a connection takes its read and write buffers from the
+    /// provider when a message starts, and gives them back when the connection
+    /// becomes idle waiting for the next request. An idle keep-alive connection
+    /// therefore holds no buffers of its own, and buffers can be reused across
+    /// connections by the application.
+    ///
+    /// While waiting for a request head without a read buffer, the connection
+    /// reads into a small stack buffer, and takes a buffer from the provider
+    /// only once bytes arrive.
+    ///
+    /// By default, no provider is set, and each connection allocates and keeps
+    /// its own buffers for its whole lifetime.
+    ///
+    /// See [`BufProvider`] for an example pool.
+    pub fn buffer_provider(&mut self, provider: Arc<dyn BufProvider>) -> &mut Self {
+        self.buffer_provider = Some(provider);
+        self
+    }
+
     /// Bind a connection together with a [`Service`](crate::service::Service).
     ///
     /// This returns a Future that must be polled in order for HTTP to be
@@ -515,6 +645,9 @@ impl Builder {
         }
         if !self.date_header {
             conn.disable_date_header();
+        }
+        if let Some(provider) = self.buffer_provider.clone() {
+            conn.set_buffer_provider(provider);
         }
         let sd = proto::h1::dispatch::Server::new(service);
         let proto = proto::h1::Dispatcher::new(sd, conn);

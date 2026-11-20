@@ -169,6 +169,10 @@ where
         ready!(self.poll_loop(cx))?;
 
         if self.is_done() {
+            // The connection will not read or write another message, so the
+            // buffers can go back to the provider now.
+            #[cfg(feature = "server")]
+            self.conn.release_buffers();
             if let Some(pending) = self.conn.pending_upgrade() {
                 self.conn.take_error()?;
                 return Poll::Ready(Ok(Dispatched::Upgrade(pending)));

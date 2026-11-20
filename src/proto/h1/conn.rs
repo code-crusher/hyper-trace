@@ -107,6 +107,14 @@ where
         self.io.set_max_buf_size(max);
     }
 
+    #[cfg(feature = "server")]
+    pub(crate) fn set_buffer_provider(
+        &mut self,
+        provider: std::sync::Arc<dyn crate::server::conn::http1::BufProvider>,
+    ) {
+        self.io.set_buffer_provider(provider);
+    }
+
     #[cfg(feature = "client")]
     pub(crate) fn set_read_buf_exact_size(&mut self, sz: usize) {
         self.io.set_read_buf_exact_size(sz);
@@ -569,6 +577,13 @@ where
 
     fn try_keep_alive(&mut self, cx: &mut Context<'_>) {
         self.state.try_keep_alive::<T>();
+        #[cfg(feature = "server")]
+        if self.state.is_idle() {
+            // The connection is waiting for the next request, so give the
+            // buffers back and wait for bytes without holding one.
+            self.io.release_provider_bufs();
+            self.io.arm_peek_read();
+        }
         self.maybe_notify(cx);
     }
 
@@ -908,6 +923,15 @@ where
             trace!("disable_keep_alive; in-progress connection");
             self.state.disable_keep_alive();
         }
+    }
+
+    /// Give any borrowed buffers back to the provider, if one is set.
+    ///
+    /// Called when the connection is finished, so that a pooling provider can
+    /// reuse the buffers rather than have them freed with the connection.
+    #[cfg(feature = "server")]
+    pub(crate) fn release_buffers(&mut self) {
+        self.io.release_provider_bufs();
     }
 
     pub(crate) fn take_error(&mut self) -> crate::Result<()> {

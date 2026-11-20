@@ -2,17 +2,27 @@ use std::cmp;
 use std::fmt;
 use std::io::{self, IoSlice};
 use std::pin::Pin;
+#[cfg(feature = "server")]
+use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use crate::rt::{Read, ReadBuf, Write};
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use futures_core::ready;
 
+#[cfg(feature = "server")]
+use crate::server::conn::http1::BufProvider;
+
 use super::{Http1Transaction, ParseContext, ParsedMessage};
 use crate::common::buf::BufList;
 
 /// The initial buffer size allocated before trying to read from IO.
 pub(crate) const INIT_BUFFER_SIZE: usize = 8192;
+
+/// The size of the stack buffer used to peek for bytes while no read buffer
+/// is held.
+#[cfg(feature = "server")]
+const STACK_READ_BUF_SIZE: usize = 512;
 
 /// The minimum value that can be set to max buffer size.
 pub(crate) const MINIMUM_MAX_BUFFER_SIZE: usize = INIT_BUFFER_SIZE;
@@ -36,6 +46,25 @@ pub(crate) struct Buffered<T, B> {
     read_blocked: bool,
     read_buf: BytesMut,
     read_buf_strategy: ReadStrategy,
+    /// If set, buffers are borrowed from this provider while a message is
+    /// being read or written, and returned to it while the connection is idle.
+    #[cfg(feature = "server")]
+    provider: Option<Arc<dyn BufProvider>>,
+    /// Whether the next read with no read buffer should be peeked into a
+    /// stack buffer before taking one from the provider.
+    ///
+    /// This is armed while the connection waits for a new message, and
+    /// disarmed as soon as a real read buffer is taken, so that body reads
+    /// are never limited to the stack buffer size.
+    #[cfg(feature = "server")]
+    peek_read: bool,
+    /// Whether the read buffer is currently borrowed from the provider.
+    #[cfg(feature = "server")]
+    read_borrowed: bool,
+    /// Whether the write (head) buffer is currently borrowed from the
+    /// provider.
+    #[cfg(feature = "server")]
+    write_borrowed: bool,
     write_buf: WriteBuf<B>,
 }
 
@@ -70,7 +99,94 @@ where
             read_blocked: false,
             read_buf: BytesMut::with_capacity(0),
             read_buf_strategy: ReadStrategy::default(),
+            #[cfg(feature = "server")]
+            provider: None,
+            #[cfg(feature = "server")]
+            peek_read: false,
+            #[cfg(feature = "server")]
+            read_borrowed: false,
+            #[cfg(feature = "server")]
+            write_borrowed: false,
             write_buf,
+        }
+    }
+
+    #[cfg(feature = "server")]
+    pub(crate) fn set_buffer_provider(&mut self, provider: Arc<dyn BufProvider>) {
+        debug_assert!(!self.write_buf.has_remaining());
+        // The default write buffer is allocated eagerly. With a provider, the
+        // buffer is borrowed only when a message is being written, so let go
+        // of the default allocation now.
+        self.write_buf.take_headers_buf();
+        self.provider = Some(provider);
+        // A server connection starts out waiting for the first request, so it
+        // should wait for bytes before borrowing a read buffer.
+        self.arm_peek_read();
+    }
+
+    /// Borrow a read buffer from the provider, if none is held.
+    ///
+    /// While the connection is waiting for a new message, the provider is
+    /// only asked for a buffer once bytes have arrived; until then reads are
+    /// peeked into a stack buffer.
+    #[cfg(feature = "server")]
+    fn take_read_buf_from_provider(&mut self) {
+        if self.provider.is_none() || self.read_borrowed {
+            return;
+        }
+        self.peek_read = false;
+        let min = self.read_buf_strategy.next();
+        let buf = self.provider.as_ref().map(|p| p.take_read(min));
+        self.read_buf = buf.unwrap_or_default();
+        self.read_borrowed = true;
+    }
+
+    /// Borrow the write (head) buffer from the provider, if not already held.
+    #[cfg(feature = "server")]
+    pub(crate) fn take_write_buf_from_provider(&mut self) {
+        if self.write_borrowed {
+            return;
+        }
+        if let Some(provider) = &self.provider {
+            let buf = provider.take_write();
+            self.write_buf.set_headers_buf(buf);
+            self.write_borrowed = true;
+        }
+    }
+
+    /// Return buffers that are no longer needed to the provider.
+    ///
+    /// Only empty buffers are returned; anything still holding unprocessed
+    /// bytes is retained by the connection.
+    #[cfg(feature = "server")]
+    pub(crate) fn release_provider_bufs(&mut self) {
+        if self.provider.is_none() {
+            return;
+        }
+        if self.read_borrowed && self.read_buf.is_empty() {
+            let buf = std::mem::take(&mut self.read_buf);
+            self.read_borrowed = false;
+            if let Some(provider) = &self.provider {
+                provider.give_read(buf);
+            }
+        }
+        if self.write_borrowed
+            && self.write_buf.headers.bytes.is_empty()
+            && self.write_buf.queue.bufs_cnt() == 0
+        {
+            let buf = self.write_buf.take_headers_buf();
+            self.write_borrowed = false;
+            if let Some(provider) = &self.provider {
+                provider.give_write(buf);
+            }
+        }
+    }
+
+    /// Arm peeking for the next read, if a provider is configured.
+    #[cfg(feature = "server")]
+    pub(crate) fn arm_peek_read(&mut self) {
+        if self.provider.is_some() && self.read_buf.is_empty() {
+            self.peek_read = true;
         }
     }
 
@@ -137,6 +253,10 @@ where
     }
 
     pub(crate) fn headers_buf(&mut self) -> &mut Vec<u8> {
+        // Encoding a message head writes into this buffer, so borrow one
+        // from the provider if none is held.
+        #[cfg(feature = "server")]
+        self.take_write_buf_from_provider();
         let buf = self.write_buf.headers_mut();
         &mut buf.bytes
     }
@@ -230,6 +350,15 @@ where
 
     pub(crate) fn poll_read_from_io(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<usize>> {
         self.read_blocked = false;
+
+        #[cfg(feature = "server")]
+        if self.peek_read && self.read_buf.is_empty() {
+            return self.poll_peek_from_io(cx);
+        }
+
+        #[cfg(feature = "server")]
+        self.take_read_buf_from_provider();
+
         // Get the next amount to allocate, but make sure we don't go over
         // the max read buf size configured.
         let next = cmp::min(
@@ -257,6 +386,36 @@ where
                     self.read_buf.advance_mut(n);
                 }
                 self.read_buf_strategy.record(n);
+                Poll::Ready(Ok(n))
+            }
+            Poll::Pending => {
+                self.read_blocked = true;
+                Poll::Pending
+            }
+            Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
+        }
+    }
+
+    /// Read into a small stack buffer, and only take a buffer from the
+    /// provider if any bytes arrived.
+    ///
+    /// This lets an idle connection wait for the next request without holding
+    /// on to a read buffer.
+    #[cfg(feature = "server")]
+    fn poll_peek_from_io(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<usize>> {
+        let mut stack_buf = [0u8; STACK_READ_BUF_SIZE];
+        let mut buf = ReadBuf::new(&mut stack_buf);
+        match Pin::new(&mut self.io).poll_read(cx, buf.unfilled()) {
+            Poll::Ready(Ok(())) => {
+                let n = buf.filled().len();
+                trace!("received {} bytes (peeked)", n);
+                if n > 0 {
+                    // Bytes arrived, so a real buffer is needed after all.
+                    // Take one, then move the peeked bytes into it.
+                    self.take_read_buf_from_provider();
+                    self.read_buf.extend_from_slice(buf.filled());
+                    self.read_buf_strategy.record(n);
+                }
                 Poll::Ready(Ok(n))
             }
             Poll::Pending => {
@@ -546,6 +705,22 @@ impl<B: Buf> WriteBuf<B> {
         self.strategy = strategy;
     }
 
+    /// Replace the headers buffer with one supplied by a provider.
+    #[cfg(feature = "server")]
+    fn set_headers_buf(&mut self, buf: Vec<u8>) {
+        debug_assert!(self.headers.bytes.is_empty());
+        debug_assert_eq!(self.headers.pos, 0);
+        self.headers.bytes = buf;
+    }
+
+    /// Take the headers buffer, leaving an empty one behind.
+    #[cfg(feature = "server")]
+    fn take_headers_buf(&mut self) -> Vec<u8> {
+        debug_assert!(self.headers.bytes.is_empty());
+        debug_assert_eq!(self.headers.pos, 0);
+        std::mem::take(&mut self.headers.bytes)
+    }
+
     pub(super) fn buffer<BB: Buf + Into<B>>(&mut self, mut buf: BB) {
         debug_assert!(buf.has_remaining());
         match self.strategy {
@@ -723,6 +898,157 @@ mod tests {
             buffered.read_buf,
             b"HTTP/1.1 200 OK\r\nServer: hyper\r\n"[..]
         );
+    }
+
+    /// A provider that records what it was given, and how often it was asked.
+    #[cfg(feature = "server")]
+    #[derive(Default)]
+    struct TestProvider {
+        reads: std::sync::Mutex<Vec<BytesMut>>,
+        writes: std::sync::Mutex<Vec<Vec<u8>>>,
+        took_read: std::sync::atomic::AtomicUsize,
+        took_write: std::sync::atomic::AtomicUsize,
+        gave_read: std::sync::atomic::AtomicUsize,
+        gave_write: std::sync::atomic::AtomicUsize,
+    }
+
+    #[cfg(feature = "server")]
+    impl TestProvider {
+        fn take_count(&self) -> (usize, usize) {
+            (
+                self.took_read.load(std::sync::atomic::Ordering::SeqCst),
+                self.took_write.load(std::sync::atomic::Ordering::SeqCst),
+            )
+        }
+
+        fn give_count(&self) -> (usize, usize) {
+            (
+                self.gave_read.load(std::sync::atomic::Ordering::SeqCst),
+                self.gave_write.load(std::sync::atomic::Ordering::SeqCst),
+            )
+        }
+    }
+
+    #[cfg(feature = "server")]
+    impl crate::server::conn::http1::BufProvider for TestProvider {
+        fn take_read(&self, min: usize) -> BytesMut {
+            self.took_read
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let mut buf = self.reads.lock().unwrap().pop().unwrap_or_default();
+            buf.reserve(min);
+            buf
+        }
+
+        fn give_read(&self, buf: BytesMut) {
+            assert!(buf.is_empty(), "returned read buffer must be empty");
+            self.gave_read
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.reads.lock().unwrap().push(buf);
+        }
+
+        fn take_write(&self) -> Vec<u8> {
+            self.took_write
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.writes.lock().unwrap().pop().unwrap_or_default()
+        }
+
+        fn give_write(&self, buf: Vec<u8>) {
+            assert!(buf.is_empty(), "returned write buffer must be empty");
+            self.gave_write
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.writes.lock().unwrap().push(buf);
+        }
+    }
+
+    #[cfg(feature = "server")]
+    #[tokio::test]
+    async fn provider_buffers_are_borrowed_and_returned() {
+        use crate::server::conn::http1::BufProvider;
+        use std::sync::Arc;
+
+        let provider = Arc::new(TestProvider::default());
+        // Seed the pool so the first take reuses an existing allocation.
+        provider
+            .reads
+            .lock()
+            .unwrap()
+            .push(BytesMut::with_capacity(INIT_BUFFER_SIZE));
+        provider.writes.lock().unwrap().push(Vec::with_capacity(512));
+
+        let mock = Mock::new().read(b"GET / HTTP/1.1\r\n").build();
+        let mut buffered = Buffered::<_, Cursor<Vec<u8>>>::new(Compat::new(mock));
+        buffered.set_buffer_provider(provider.clone() as Arc<dyn BufProvider>);
+
+        // The default eager write allocation is dropped when a provider is set.
+        assert_eq!(buffered.write_buf.headers.bytes.capacity(), 0);
+
+        // Reading borrows a read buffer from the pool.
+        let n = futures_util::future::poll_fn(|cx| buffered.poll_read_from_io(cx))
+            .await
+            .unwrap();
+        assert_eq!(n, b"GET / HTTP/1.1\r\n".len());
+        assert_eq!(provider.take_count(), (1, 0));
+        assert_eq!(
+            buffered.read_buf.capacity(),
+            INIT_BUFFER_SIZE,
+            "pooled buffer reused"
+        );
+
+        // Encoding a head borrows a write buffer from the pool.
+        buffered
+            .headers_buf()
+            .extend_from_slice(b"HTTP/1.1 200 OK\r\n");
+        assert_eq!(provider.take_count(), (1, 1));
+
+        // Releasing keeps the read buffer, which still holds unparsed bytes,
+        // and keeps the write buffer, which still holds unflushed bytes.
+        buffered.release_provider_bufs();
+        assert_eq!(provider.give_count(), (0, 0));
+
+        // Once both are drained, both are returned.
+        buffered.read_buf.clear();
+        buffered.write_buf.headers.reset();
+        buffered.release_provider_bufs();
+        assert_eq!(provider.give_count(), (1, 1));
+        assert_eq!(buffered.read_buf.capacity(), 0);
+        assert_eq!(buffered.read_buf.len(), 0);
+        assert_eq!(buffered.write_buf.headers.bytes.capacity(), 0);
+
+        // Both allocations were reused rather than newly allocated.
+        assert_eq!(provider.reads.lock().unwrap().len(), 1);
+        assert_eq!(provider.writes.lock().unwrap().len(), 1);
+    }
+
+    #[cfg(feature = "server")]
+    #[tokio::test]
+    async fn provider_peeks_before_taking_a_read_buf() {
+        use crate::server::conn::http1::BufProvider;
+        use std::sync::Arc;
+
+        let provider = Arc::new(TestProvider::default());
+        let (io, mut handle) = Mock::new().build_with_handle();
+        let mut buffered = Buffered::<_, Cursor<Vec<u8>>>::new(Compat::new(io));
+        buffered.set_buffer_provider(provider.clone() as Arc<dyn BufProvider>);
+        buffered.arm_peek_read();
+
+        // The first read blocks with no bytes: the connection must not be
+        // holding a read buffer while it waits.
+        futures_util::future::poll_fn(|cx| {
+            assert!(buffered.poll_read_from_io(cx).is_pending());
+            Poll::Ready(())
+        })
+        .await;
+        assert_eq!(provider.take_count(), (0, 0), "no buffer taken while idle");
+
+        // Once bytes arrive, a buffer is taken and the peeked bytes kept.
+        handle.read(b"GET / HTTP/1.1\r\n");
+        let n = futures_util::future::poll_fn(|cx| buffered.poll_read_from_io(cx))
+            .await
+            .unwrap();
+        assert_eq!(n, b"GET / HTTP/1.1\r\n".len());
+        assert_eq!(provider.take_count(), (1, 0));
+        assert!(!buffered.peek_read);
+        assert_eq!(buffered.read_buf, b"GET / HTTP/1.1\r\n"[..]);
     }
 
     #[test]

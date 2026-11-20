@@ -6,7 +6,7 @@ use std::io::{self, Read, Write};
 use std::net::TcpListener as StdTcpListener;
 use std::net::{Shutdown, SocketAddr, TcpStream};
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
@@ -4147,4 +4147,228 @@ impl TestClient {
             sender.send_request(req).await
         }
     }
+}
+
+// ===== buffer provider =====
+
+/// A pooling `BufProvider` that records what it is given.
+#[derive(Default)]
+struct TestPool {
+    reads: Mutex<Vec<bytes::BytesMut>>,
+    writes: Mutex<Vec<Vec<u8>>>,
+    took_read: AtomicUsize,
+    took_write: AtomicUsize,
+    gave_read: AtomicUsize,
+    gave_write: AtomicUsize,
+}
+
+impl TestPool {
+    fn counts(&self) -> (usize, usize, usize, usize) {
+        (
+            self.took_read.load(Ordering::SeqCst),
+            self.gave_read.load(Ordering::SeqCst),
+            self.took_write.load(Ordering::SeqCst),
+            self.gave_write.load(Ordering::SeqCst),
+        )
+    }
+
+    /// Wait until the pool has had both of its buffers returned, meaning the
+    /// connection is idle and holds none.
+    async fn wait_idle(&self) {
+        for _ in 0..200 {
+            if self.gave_read.load(Ordering::SeqCst) > 0
+                && self.gave_write.load(Ordering::SeqCst) > 0
+            {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        panic!("connection never returned its buffers: {:?}", self.counts());
+    }
+}
+
+impl hyper::server::conn::http1::BufProvider for TestPool {
+    fn take_read(&self, min: usize) -> bytes::BytesMut {
+        self.took_read.fetch_add(1, Ordering::SeqCst);
+        let mut buf = self.reads.lock().unwrap().pop().unwrap_or_default();
+        buf.reserve(min);
+        buf
+    }
+
+    fn give_read(&self, buf: bytes::BytesMut) {
+        assert!(buf.is_empty(), "returned read buffer must be empty");
+        self.gave_read.fetch_add(1, Ordering::SeqCst);
+        self.reads.lock().unwrap().push(buf);
+    }
+
+    fn take_write(&self) -> Vec<u8> {
+        self.took_write.fetch_add(1, Ordering::SeqCst);
+        self.writes.lock().unwrap().pop().unwrap_or_default()
+    }
+
+    fn give_write(&self, buf: Vec<u8>) {
+        assert!(buf.is_empty(), "returned write buffer must be empty");
+        self.gave_write.fetch_add(1, Ordering::SeqCst);
+        self.writes.lock().unwrap().push(buf);
+    }
+}
+
+#[tokio::test]
+async fn http1_buffer_provider_idle_returns_buffers() {
+    use hyper::server::conn::http1::BufProvider;
+
+    let _ = pretty_env_logger::try_init();
+    let pool = Arc::new(TestPool::default());
+
+    let (mut client_io, server_io) = tokio::io::duplex(8192);
+    let conn = http1::Builder::new()
+        .buffer_provider(pool.clone() as Arc<dyn BufProvider>)
+        .serve_connection(TokioIo::new(server_io), HelloWorld);
+    let conn = tokio::spawn(conn);
+
+    // Before any request arrives, the connection waits without borrowing
+    // anything from the pool.
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    assert_eq!(pool.took_read.load(Ordering::SeqCst), 0);
+    assert_eq!(pool.took_write.load(Ordering::SeqCst), 0);
+
+    // First request; the connection then goes idle again.
+    client_io
+        .write_all(b"GET / HTTP/1.1\r\nHost: example.domain\r\n\r\n")
+        .await
+        .unwrap();
+    let mut buf = vec![0; 1024];
+    let n = client_io.read(&mut buf).await.unwrap();
+    assert!(
+        s(&buf[..n]).starts_with("HTTP/1.1 200 OK\r\n"),
+        "response: {:?}",
+        s(&buf[..n])
+    );
+
+    // Idle again: the read buffer and the head buffer went back to the pool.
+    pool.wait_idle().await;
+
+    // A second request reuses the pooled buffers, and the connection still
+    // works.
+    client_io
+        .write_all(b"GET /2 HTTP/1.1\r\nHost: example.domain\r\nConnection: close\r\n\r\n")
+        .await
+        .unwrap();
+    let n = client_io.read(&mut buf).await.unwrap();
+    assert!(
+        s(&buf[..n]).starts_with("HTTP/1.1 200 OK\r\n"),
+        "response: {:?}",
+        s(&buf[..n])
+    );
+
+    let mut rest = Vec::new();
+    client_io.read_to_end(&mut rest).await.unwrap();
+    conn.await.unwrap().unwrap();
+
+    // The buffers were borrowed again for the second request rather than
+    // allocated fresh, and every borrowed buffer was returned.
+    let (took_read, gave_read, took_write, gave_write) = pool.counts();
+    assert!(took_read >= 2, "second request must borrow a read buffer");
+    assert!(took_write >= 2, "second request must borrow a write buffer");
+    assert!(gave_read >= 1 && gave_write >= 1);
+}
+
+#[tokio::test]
+async fn http1_buffer_provider_pipelined_requests() {
+    use hyper::server::conn::http1::BufProvider;
+
+    let _ = pretty_env_logger::try_init();
+    let pool = Arc::new(TestPool::default());
+
+    let (mut client_io, server_io) = tokio::io::duplex(8192);
+    let conn = http1::Builder::new()
+        .buffer_provider(pool.clone() as Arc<dyn BufProvider>)
+        .serve_connection(TokioIo::new(server_io), HelloWorld);
+    let conn = tokio::spawn(conn);
+
+    // Three pipelined requests in a single write, sharing one read buffer.
+    client_io
+        .write_all(
+            b"GET /1 HTTP/1.1\r\nHost: example.domain\r\n\r\n\
+              GET /2 HTTP/1.1\r\nHost: example.domain\r\n\r\n\
+              GET /3 HTTP/1.1\r\nHost: example.domain\r\nConnection: close\r\n\r\n",
+        )
+        .await
+        .unwrap();
+
+    let mut all = Vec::new();
+    let mut buf = vec![0; 1024];
+    loop {
+        let n = client_io.read(&mut buf).await.unwrap();
+        if n == 0 {
+            break;
+        }
+        all.extend_from_slice(&buf[..n]);
+    }
+
+    let text = s(&all);
+    assert_eq!(
+        text.matches("HTTP/1.1 200 OK\r\n").count(),
+        3,
+        "all pipelined requests must be answered: {:?}",
+        text
+    );
+    conn.await.unwrap().unwrap();
+
+    let (took_read, gave_read, _, _) = pool.counts();
+    assert!(gave_read >= 1);
+    assert!(took_read <= gave_read + 1);
+}
+
+#[tokio::test]
+async fn http1_buffer_provider_with_bodies() {
+    use hyper::server::conn::http1::BufProvider;
+
+    let _ = pretty_env_logger::try_init();
+    let pool = Arc::new(TestPool::default());
+
+    let (mut client_io, server_io) = tokio::io::duplex(8192);
+    let service = service_fn(|req: Request<IncomingBody>| async move {
+        let body = req.into_body().collect().await.unwrap().to_bytes();
+        Ok::<_, hyper::Error>(Response::new(Full::new(body)))
+    });
+    let conn = http1::Builder::new()
+        .buffer_provider(pool.clone() as Arc<dyn BufProvider>)
+        .serve_connection(TokioIo::new(server_io), service);
+    let conn = tokio::spawn(conn);
+
+    // A request with a body spanning several reads exercises the body decoder,
+    // which must use the provider's read buffer.
+    let body = "x".repeat(16 * 1024);
+    let mut req = format!(
+        "POST / HTTP/1.1\r\nHost: example.domain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len()
+    )
+    .into_bytes();
+    req.extend_from_slice(body.as_bytes());
+    client_io.write_all(&req).await.unwrap();
+
+    let mut all = Vec::new();
+    let mut buf = vec![0; 4096];
+    loop {
+        let n = client_io.read(&mut buf).await.unwrap();
+        if n == 0 {
+            break;
+        }
+        all.extend_from_slice(&buf[..n]);
+    }
+
+    let text = s(&all);
+    assert!(text.starts_with("HTTP/1.1 200 OK\r\n"), "response: {:?}", text);
+    let body_start = all
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .expect("headers end")
+        + 4;
+    assert_eq!(
+        all[body_start..].len(),
+        body.len(),
+        "echoed body length must match"
+    );
+    conn.await.unwrap().unwrap();
 }
