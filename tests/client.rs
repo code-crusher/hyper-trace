@@ -2129,6 +2129,22 @@ mod conn {
         assert_eq!(vec, b"bar=foo");
     }
 
+    /// The type returned by `Connection::with_upgrades()` must be nameable
+    /// outside the crate, like the server-side `UpgradeableConnection`. Callers
+    /// store it in a struct or a `Box`, which needs a path to write down.
+    #[test]
+    fn upgradeable_connection_is_nameable() {
+        type Io = support::TokioIo<tokio::io::DuplexStream>;
+        type Conn = conn::http1::UpgradeableConnection<Io, Empty<Bytes>>;
+
+        // The shape from the issue: hold the future in a struct field.
+        struct Holder {
+            _conn: Option<Conn>,
+        }
+
+        let _ = Holder { _conn: None };
+    }
+
     #[test]
     fn connect_method() {
         let (server, addr) = setup_std_test_server();

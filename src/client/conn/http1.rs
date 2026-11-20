@@ -301,8 +301,8 @@ where
     /// Enable this connection to support higher-level HTTP upgrades.
     ///
     /// See [the `upgrade` module](crate::upgrade) for more.
-    pub fn with_upgrades(self) -> upgrades::UpgradeableConnection<T, B> {
-        upgrades::UpgradeableConnection { inner: Some(self) }
+    pub fn with_upgrades(self) -> UpgradeableConnection<T, B> {
+        UpgradeableConnection { inner: Some(self) }
     }
 }
 
@@ -631,57 +631,50 @@ impl Builder {
     }
 }
 
-mod upgrades {
-    use super::{Connection, Context, Future, Parts, Pin, Poll, Read, StdError, Write};
-    use crate::body::Body;
-    use crate::proto::Dispatched;
-    use crate::upgrade::Upgraded;
-    use futures_core::ready;
-    // A future binding a connection with a Service with Upgrade support.
-    //
-    // This type is unnameable outside the crate.
-    #[must_use = "futures do nothing unless polled"]
-    #[allow(missing_debug_implementations)]
-    pub struct UpgradeableConnection<T, B>
-    where
-        T: Read + Write + Unpin + Send + 'static,
-        B: Body + 'static,
-        B::Error: Into<Box<dyn StdError + Send + Sync>>,
-    {
-        pub(super) inner: Option<Connection<T, B>>,
-    }
+/// A future binding a connection with a Service with Upgrade support.
+///
+/// This is the type returned by [`Connection::with_upgrades()`].
+#[must_use = "futures do nothing unless polled"]
+#[allow(missing_debug_implementations)]
+pub struct UpgradeableConnection<T, B>
+where
+    T: Read + Write + Unpin + Send + 'static,
+    B: Body + 'static,
+    B::Error: Into<Box<dyn StdError + Send + Sync>>,
+{
+    pub(super) inner: Option<Connection<T, B>>,
+}
 
-    impl<I, B> Future for UpgradeableConnection<I, B>
-    where
-        I: Read + Write + Unpin + Send + 'static,
-        B: Body + 'static,
-        B::Data: Send,
-        B::Error: Into<Box<dyn StdError + Send + Sync>>,
-    {
-        type Output = crate::Result<()>;
+impl<I, B> Future for UpgradeableConnection<I, B>
+where
+    I: Read + Write + Unpin + Send + 'static,
+    B: Body + 'static,
+    B::Data: Send,
+    B::Error: Into<Box<dyn StdError + Send + Sync>>,
+{
+    type Output = crate::Result<()>;
 
-        fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-            match ready!(Pin::new(
-                &mut self
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        match ready!(Pin::new(
+            &mut self
+                .inner
+                .as_mut()
+                .expect("upgradeable client connection polled after upgrade")
+                .inner,
+        )
+        .poll(cx))
+        {
+            Ok(proto::Dispatched::Shutdown) => Poll::Ready(Ok(())),
+            Ok(proto::Dispatched::Upgrade(pending)) => {
+                let Parts { io, read_buf } = self
                     .inner
-                    .as_mut()
-                    .expect("upgradeable client connection polled after upgrade")
-                    .inner,
-            )
-            .poll(cx))
-            {
-                Ok(Dispatched::Shutdown) => Poll::Ready(Ok(())),
-                Ok(Dispatched::Upgrade(pending)) => {
-                    let Parts { io, read_buf } = self
-                        .inner
-                        .take()
-                        .expect("upgradeable client connection missing after upgrade")
-                        .into_parts();
-                    pending.fulfill(Upgraded::new(io, read_buf));
-                    Poll::Ready(Ok(()))
-                }
-                Err(e) => Poll::Ready(Err(e)),
+                    .take()
+                    .expect("upgradeable client connection missing after upgrade")
+                    .into_parts();
+                pending.fulfill(crate::upgrade::Upgraded::new(io, read_buf));
+                Poll::Ready(Ok(()))
             }
+            Err(e) => Poll::Ready(Err(e)),
         }
     }
 }
