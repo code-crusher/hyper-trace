@@ -1588,7 +1588,9 @@ test! {
 }
 
 mod conn {
+    use std::convert::Infallible;
     use std::error::Error;
+    use std::future::Future;
     use std::io::{self, Read, Write};
     use std::net::{SocketAddr, TcpListener};
     use std::pin::Pin;
@@ -1603,6 +1605,7 @@ mod conn {
     use bytes::{Buf, Bytes};
     use futures_channel::{mpsc, oneshot};
     use futures_util::future::{self, poll_fn, FutureExt, TryFutureExt};
+    use futures_util::{SinkExt as _, StreamExt as _};
     use http_body_util::combinators::BoxBody;
     use http_body_util::{BodyExt, Empty, Full, StreamBody};
     use hyper::rt::Timer;
@@ -1651,6 +1654,112 @@ mod conn {
         const TEST_SOCKET: SocketAddr = SocketAddr::new(TEST_ADDR, 8080);
 
         (ioa, iob, TEST_SOCKET)
+    }
+
+    type RecordedWrites = Arc<std::sync::Mutex<Vec<Vec<u8>>>>;
+
+    /// Wraps a duplex stream and records the bytes of every successful write,
+    /// so tests can see how h2 grouped frames on the wire.
+    struct RecordingIo {
+        inner: DuplexStream,
+        writes: RecordedWrites,
+    }
+
+    impl tokio::io::AsyncRead for RecordingIo {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            Pin::new(&mut self.inner).poll_read(cx, buf)
+        }
+    }
+
+    impl tokio::io::AsyncWrite for RecordingIo {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            match Pin::new(&mut self.inner).poll_write(cx, buf) {
+                Poll::Ready(Ok(n)) => {
+                    self.writes.lock().unwrap().push(buf[..n].to_vec());
+                    Poll::Ready(Ok(n))
+                }
+                other => other,
+            }
+        }
+
+        fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Pin::new(&mut self.inner).poll_flush(cx)
+        }
+
+        fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Pin::new(&mut self.inner).poll_shutdown(cx)
+        }
+    }
+
+    const DATA: u8 = 0x0;
+    const HEADERS: u8 = 0x1;
+
+    /// Returns `(frame_type, payload_len)` for each frame in `write`.
+    fn frames(write: &[u8]) -> Vec<(u8, usize)> {
+        let mut frames = Vec::new();
+        let mut rest = write;
+        while rest.len() >= 9 {
+            let len = ((rest[0] as usize) << 16) | ((rest[1] as usize) << 8) | rest[2] as usize;
+            frames.push((rest[3], len));
+            if rest.len() < 9 + len {
+                break;
+            }
+            rest = &rest[9 + len..];
+        }
+        frames
+    }
+
+    /// The frames of every recorded write that carried a request frame, i.e.
+    /// HEADERS or DATA, in the order they hit the socket. Control frames that
+    /// happened to share a write are dropped, so the assertion only sees what
+    /// the request put on the wire.
+    fn request_writes(writes: &RecordedWrites) -> Vec<Vec<(u8, usize)>> {
+        writes
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|write| {
+                frames(write)
+                    .into_iter()
+                    .filter(|&(kind, _)| kind == HEADERS || kind == DATA)
+                    .collect::<Vec<_>>()
+            })
+            .filter(|frames| !frames.is_empty())
+            .collect()
+    }
+
+    /// An h2 server that echoes each request body back and reports every
+    /// request's headers as soon as they are accepted.
+    fn echo_server(
+        server_io: DuplexStream,
+        headers_seen: mpsc::UnboundedSender<()>,
+    ) -> impl Future<Output = ()> {
+        async move {
+            let mut h2 = h2::server::handshake(server_io).await.unwrap();
+            while let Some(result) = h2.accept().await {
+                let (req, mut respond) = result.unwrap();
+                let _ = headers_seen.unbounded_send(());
+                tokio::spawn(async move {
+                    let mut body = req.into_body();
+                    let mut received = Vec::new();
+                    while let Some(chunk) = body.data().await {
+                        let chunk = chunk.unwrap();
+                        let _ = body.flow_control().release_capacity(chunk.len());
+                        received.extend_from_slice(&chunk);
+                    }
+                    let mut send = respond.send_response(Response::new(()), false).unwrap();
+                    let _ = send.send_data(Bytes::from(received), true);
+                });
+            }
+        }
     }
 
     #[tokio::test]
@@ -3520,6 +3629,136 @@ mod conn {
 
         let _ = stream_a_done_tx.send(());
         drop(upgraded);
+    }
+
+    // https://github.com/hyperium/hyper/issues/4241
+    //
+    // A request whose body is ready right away should have its first DATA
+    // frame queued in the same socket write as the HEADERS frame. h2 only
+    // opens a locally initiated stream from the connection task, and that is
+    // also where the stream is first assigned send capacity, so a body pipe
+    // that waits for capacity before handing over its first chunk always
+    // yields first: the connection then flushes the HEADERS on its own and the
+    // DATA follows in a second write.
+    #[tokio::test]
+    async fn h2_ready_body_shares_write_with_headers() {
+        let (client_io, server_io, _) = setup_duplex_test_server();
+        let writes: RecordedWrites = Arc::default();
+        let (headers_seen_tx, mut headers_seen_rx) = mpsc::unbounded();
+        tokio::spawn(echo_server(server_io, headers_seen_tx));
+
+        let io = TokioIo::new(RecordingIo {
+            inner: client_io,
+            writes: writes.clone(),
+        });
+        let (mut client, conn) = conn::http2::Builder::new(TokioExecutor)
+            .handshake::<_, Full<Bytes>>(io)
+            .await
+            .expect("http handshake");
+        tokio::spawn(async move {
+            let _ = conn.await;
+        });
+
+        // Warm the connection up so that the recorded writes only cover the
+        // request under test.
+        let req = Request::post("http://localhost/warmup")
+            .body(Full::new(Bytes::from_static(b"warmup")))
+            .unwrap();
+        let res = client.send_request(req).await.expect("warmup request");
+        assert_eq!(concat(res.into_body()).await.unwrap(), "warmup");
+        headers_seen_rx.next().await.expect("warmup headers");
+        writes.lock().unwrap().clear();
+
+        let req = Request::post("http://localhost/ready")
+            .body(Full::new(Bytes::from_static(b"hello")))
+            .unwrap();
+        let res = client.send_request(req).await.expect("ready request");
+        assert_eq!(concat(res.into_body()).await.unwrap(), "hello");
+
+        // The server answered, so the client has flushed everything it queued
+        // for this request.
+        let writes = request_writes(&writes);
+        assert!(!writes.is_empty(), "expected the request to be written");
+
+        // The first write must carry the HEADERS and, right behind it, the
+        // ready body's single DATA frame. Comparing frame kinds and payload
+        // lengths keeps the assertion independent of how many bytes the HPACK
+        // encoding of the headers happens to take.
+        let first = &writes[0];
+        assert_eq!(
+            first.iter().map(|&(kind, _)| kind).collect::<Vec<_>>(),
+            vec![HEADERS, DATA],
+            "HEADERS and the ready body's DATA should share one socket write, got: {:?}",
+            writes
+        );
+        assert_eq!(first[1].1, 5, "the DATA frame should carry the whole body");
+    }
+
+    // https://github.com/hyperium/hyper/issues/4241
+    //
+    // The flip side of the test above: a body that is not ready yet must not
+    // hold the request headers back. The headers have to reach the peer as
+    // soon as the request is submitted, long before the body produces its
+    // first chunk.
+    #[tokio::test]
+    async fn h2_pending_body_sends_headers_promptly() {
+        let (client_io, server_io, _) = setup_duplex_test_server();
+        let writes: RecordedWrites = Arc::default();
+        let (headers_seen_tx, mut headers_seen_rx) = mpsc::unbounded();
+        tokio::spawn(echo_server(server_io, headers_seen_tx));
+
+        let io = TokioIo::new(RecordingIo {
+            inner: client_io,
+            writes: writes.clone(),
+        });
+        let (mut client, conn) = conn::http2::Builder::new(TokioExecutor)
+            .handshake::<_, BoxBody<Bytes, Infallible>>(io)
+            .await
+            .expect("http handshake");
+        tokio::spawn(async move {
+            let _ = conn.await;
+        });
+
+        // A body that never produces anything until the sender is used.
+        let (mut body_tx, body_rx) = mpsc::channel::<Result<Frame<Bytes>, Infallible>>(1);
+        let body = BodyExt::boxed(StreamBody::new(body_rx));
+        let req = Request::post("http://localhost/pending").body(body).unwrap();
+        let mut response_fut = std::pin::pin!(client.send_request(req));
+
+        // Poll the request, and the connection, until the server has the
+        // headers. The body has nothing to give, so the headers can only get
+        // there if they were not waiting on it.
+        let headers = poll_fn(|cx| {
+            let _ = response_fut.as_mut().poll(cx);
+            match headers_seen_rx.poll_next_unpin(cx) {
+                Poll::Ready(seen) => Poll::Ready(seen),
+                Poll::Pending => Poll::Pending,
+            }
+        });
+        tokio::time::timeout(Duration::from_secs(5), headers)
+            .await
+            .expect("headers should be sent while the body is pending")
+            .expect("server should see the request headers");
+
+        let writes = request_writes(&writes);
+        assert_eq!(
+            writes.first().map(|frames| frames[0].0),
+            Some(HEADERS),
+            "the headers should be written without waiting for the body, got: {:?}",
+            writes
+        );
+
+        // Now finish the request so nothing is left dangling.
+        body_tx
+            .send(Ok(Frame::data(Bytes::from_static(b"late"))))
+            .await
+            .expect("send body chunk");
+        drop(body_tx);
+        let res = tokio::time::timeout(Duration::from_secs(5), response_fut)
+            .await
+            .expect("response in time")
+            .expect("response");
+        assert_eq!(concat(res.into_body()).await.unwrap(), "late");
     }
 }
 

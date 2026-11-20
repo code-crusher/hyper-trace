@@ -103,6 +103,9 @@ pin_project! {
         // it survives across `Poll::Pending` returns from `poll_capacity`; if
         // we left the chunk in a local, it would be dropped on every repoll.
         buffered_data: Option<Peeked<S::Data>>,
+        // Whether any data frame has been handed to h2 yet. The first one is
+        // shipped without waiting for capacity, see `poll`.
+        sent_first_data: bool,
         #[pin]
         stream: S,
     }
@@ -122,6 +125,7 @@ where
             body_tx: tx,
             data_done: false,
             buffered_data: None,
+            sent_first_data: false,
             stream,
         }
     }
@@ -205,6 +209,33 @@ where
                             // them straight through so trailing empty frames
                             // (e.g. an explicit end-of-stream marker) are
                             // delivered.
+                            let buf = SendBuf::Buf(chunk);
+                            me.body_tx
+                                .send_data(buf, is_eos)
+                                .map_err(crate::Error::new_body_write)?;
+
+                            if is_eos {
+                                return Poll::Ready(Ok(()));
+                            }
+                            continue;
+                        }
+
+                        // The first data frame is handed to h2 without waiting
+                        // for capacity. A freshly opened stream has not been
+                        // assigned any yet: h2 only opens locally initiated
+                        // streams from the connection task, and capacity is
+                        // assigned at that point. Waiting for it here would
+                        // park the body pipe, the caller would yield, and the
+                        // connection would flush the HEADERS on its own — a
+                        // second socket write for a body that was ready all
+                        // along. `send_data` buffers the frame when there is no
+                        // capacity yet, so the connection still writes it
+                        // together with the HEADERS (issue #4241). It cannot
+                        // pin connection window on a body that never produces
+                        // data: a chunk is only ever passed once it is in hand
+                        // (#4003).
+                        if !*me.sent_first_data {
+                            *me.sent_first_data = true;
                             let buf = SendBuf::Buf(chunk);
                             me.body_tx
                                 .send_data(buf, is_eos)
