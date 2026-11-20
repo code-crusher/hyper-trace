@@ -1876,6 +1876,125 @@ async fn upgrades_new() {
 }
 
 #[tokio::test]
+async fn upgrade_with_request_connection_close() {
+    // A request with `Connection: close, Upgrade` means "upgrade the
+    // connection, or close it if the upgrade fails" (RFC 9110 §7.6.1:
+    // the field is a list of options). A 101 Switching Protocols
+    // response is not a final response, so the connection must not be
+    // closed after it.
+    let (listener, addr) = setup_tcp_listener();
+    let (read_101_tx, read_101_rx) = oneshot::channel();
+
+    thread::spawn(move || {
+        let mut tcp = connect(&addr);
+        tcp.write_all(
+            b"\
+            GET / HTTP/1.1\r\n\
+            Upgrade: foobar\r\n\
+            Connection: close, Upgrade\r\n\
+            \r\n\
+            eagerly optimistic\
+        ",
+        )
+        .expect("write 1");
+        let mut buf = [0; 256];
+        let head = read_until(&mut tcp, |b| b.ends_with(b"\r\n\r\n")).expect("read 1");
+
+        let response = s(&head);
+        assert!(response.starts_with("HTTP/1.1 101 Switching Protocols\r\n"));
+        assert!(has_header(response, "connection: upgrade"));
+        assert!(
+            !has_header(response, "close"),
+            "101 response should not say close: {response}"
+        );
+        let _ = read_101_tx.send(());
+
+        let n = tcp.read(&mut buf).expect("read 2");
+        assert_eq!(s(&buf[..n]), "foo=bar");
+        tcp.write_all(b"bar=foo").expect("write 2");
+    });
+
+    let (upgrades_tx, upgrades_rx) = mpsc::channel();
+    let svc = service_fn(move |req: Request<IncomingBody>| {
+        let on_upgrade = hyper::upgrade::on(req);
+        let _ = upgrades_tx.send(on_upgrade);
+        future::ok::<_, hyper::Error>(
+            Response::builder()
+                .status(101)
+                .header("connection", "upgrade")
+                .header("upgrade", "foobar")
+                .body(Empty::<Bytes>::new())
+                .unwrap(),
+        )
+    });
+
+    let (socket, _) = listener.accept().await.unwrap();
+    let socket = TokioIo::new(socket);
+    http1::Builder::new()
+        .serve_connection(socket, svc)
+        .with_upgrades()
+        .await
+        .unwrap();
+
+    let on_upgrade = upgrades_rx.recv().unwrap();
+
+    // wait so that we don't write until other side saw 101 response
+    read_101_rx.await.unwrap();
+
+    let upgraded = on_upgrade.await.expect("on_upgrade");
+    let parts = upgraded.downcast::<TokioIo<TkTcpStream>>().unwrap();
+    assert_eq!(parts.read_buf, "eagerly optimistic");
+
+    let mut io = parts.io.inner();
+    io.write_all(b"foo=bar").await.unwrap();
+    let mut vec = vec![];
+    io.read_to_end(&mut vec).await.unwrap();
+    assert_eq!(s(&vec), "bar=foo");
+}
+
+#[tokio::test]
+async fn upgrade_declined_with_request_connection_close() {
+    // Declining the upgrade falls back to the `close` option, so the
+    // response must ask to close the connection.
+    let (listener, addr) = setup_tcp_listener();
+
+    thread::spawn(move || {
+        let mut tcp = connect(&addr);
+        tcp.write_all(
+            b"\
+            GET / HTTP/1.1\r\n\
+            Upgrade: foobar\r\n\
+            Connection: close, Upgrade\r\n\
+            \r\n\
+        ",
+        )
+        .expect("write 1");
+        let head = read_until(&mut tcp, |b| b.ends_with(b"\r\n\r\n")).expect("read 1");
+
+        let response = s(&head);
+        assert!(response.starts_with("HTTP/1.1 200 OK\r\n"));
+        assert!(has_header(response, "connection: close"));
+
+        // the `close` option applies: the server must close the connection
+        // after the declined upgrade
+        let mut rest = Vec::new();
+        tcp.read_to_end(&mut rest).expect("read 2");
+        assert_eq!(rest, b"");
+    });
+
+    let (socket, _) = listener.accept().await.unwrap();
+    let socket = TokioIo::new(socket);
+    http1::Builder::new()
+        .serve_connection(
+            socket,
+            service_fn(|_| future::ok::<_, hyper::Error>(Response::new(Empty::<Bytes>::new()))),
+        )
+        .with_upgrades()
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
 async fn upgrades_ignored() {
     let (listener, addr) = setup_tcp_listener();
 

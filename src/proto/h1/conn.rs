@@ -709,14 +709,20 @@ where
             }
             Version::HTTP_11 => {
                 if let KA::Disabled = self.state.keep_alive.status() {
-                    match head.headers.entry(CONNECTION) {
-                        Entry::Occupied(mut entry) => {
-                            if !entry.iter().any(headers::connection_close) {
-                                entry.append(HeaderValue::from_static("close"));
+                    // A 101 Switching Protocols response hands the connection
+                    // over to the upgraded protocol instead of closing it, so
+                    // `close` must not be advertised on it, even if the
+                    // request offered it as the alternative to upgrading.
+                    if !T::is_switching_protocols(head) {
+                        match head.headers.entry(CONNECTION) {
+                            Entry::Occupied(mut entry) => {
+                                if !entry.iter().any(headers::connection_close) {
+                                    entry.append(HeaderValue::from_static("close"));
+                                }
                             }
-                        }
-                        Entry::Vacant(entry) => {
-                            entry.insert(HeaderValue::from_static("close"));
+                            Entry::Vacant(entry) => {
+                                entry.insert(HeaderValue::from_static("close"));
+                            }
                         }
                     }
                 }

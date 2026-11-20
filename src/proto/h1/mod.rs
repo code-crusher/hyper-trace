@@ -37,6 +37,19 @@ pub(crate) trait Http1Transaction {
 
     fn on_error(err: &crate::Error) -> Option<MessageHead<Self::Outgoing>>;
 
+    /// Whether the outgoing message switches this connection to a new
+    /// protocol, handing the connection over instead of finishing it with
+    /// the usual HTTP/1.1 connection management.
+    ///
+    /// This is only ever true for a server's `101 Switching Protocols`
+    /// response. A request may carry `Connection: close, Upgrade` to ask
+    /// for an upgrade *or* a connection close (the field is a list of
+    /// options, RFC 9110 §7.6.1); a `101` accepts the upgrade, so the
+    /// `close` option no longer applies to the response.
+    fn is_switching_protocols(_head: &MessageHead<Self::Outgoing>) -> bool {
+        false
+    }
+
     fn is_client() -> bool {
         !Self::is_server()
     }
