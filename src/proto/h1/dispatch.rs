@@ -5,6 +5,8 @@ use std::{
     pin::Pin,
     task::{Context, Poll},
 };
+#[cfg(feature = "server")]
+use std::time::Duration;
 
 use crate::rt::{Read, Write};
 use bytes::{Buf, Bytes};
@@ -96,12 +98,16 @@ where
     pub(crate) fn disable_keep_alive(&mut self) {
         self.conn.disable_keep_alive();
 
-        // If keep alive has been disabled and no read or write has been seen on
-        // the connection yet, we must be in a state where the server is being asked to
-        // shut down before any data has been seen on the connection
-        if self.conn.is_write_closed() || self.conn.has_initial_read_write_state() {
+        // If the write side is already closed, no further request could be
+        // responded to, so there is nothing to wait for.
+        if self.conn.is_write_closed() {
             self.close();
         }
+    }
+
+    #[cfg(feature = "server")]
+    pub(crate) fn set_graceful_shutdown_first_byte_timeout(&mut self, timeout: Duration) {
+        self.conn.set_graceful_shutdown_first_byte_timeout(timeout);
     }
 
     pub(crate) fn into_inner(self) -> (I, Bytes, D) {

@@ -60,11 +60,9 @@ where
                 h1_max_headers: None,
                 h1_max_header_size: None,
                 #[cfg(feature = "server")]
-                h1_header_read_timeout: None,
+                h1_header_read_timeout: TimeoutState::default(),
                 #[cfg(feature = "server")]
-                h1_header_read_timeout_fut: None,
-                #[cfg(feature = "server")]
-                h1_header_read_timeout_running: false,
+                h1_graceful_shutdown_first_byte_read_timeout: TimeoutState::default(),
                 #[cfg(feature = "server")]
                 date_header: true,
                 #[cfg(feature = "server")]
@@ -148,7 +146,14 @@ where
 
     #[cfg(feature = "server")]
     pub(crate) fn set_http1_header_read_timeout(&mut self, val: Duration) {
-        self.state.h1_header_read_timeout = Some(val);
+        self.state.h1_header_read_timeout.timeout = Some(val);
+    }
+
+    #[cfg(feature = "server")]
+    pub(crate) fn set_graceful_shutdown_first_byte_timeout(&mut self, val: Duration) {
+        self.state
+            .h1_graceful_shutdown_first_byte_read_timeout
+            .timeout = Some(val);
     }
 
     #[cfg(feature = "server")]
@@ -213,6 +218,24 @@ where
         read_buf.len() >= 24 && read_buf[..24] == *H2_PREFACE
     }
 
+    /// Close the connection if nothing has been read from or written to it yet.
+    ///
+    /// This is used once the graceful shutdown grace period has elapsed: if the
+    /// client has still not started sending a request, keeping the connection
+    /// open would serve no purpose.
+    ///
+    /// Returns whether the connection was closed.
+    #[cfg(feature = "server")]
+    fn close_if_inactive(&mut self) -> bool {
+        if self.state.is_idle() || self.has_initial_read_write_state() {
+            trace!("close_if_inactive: closing inactive connection");
+            self.state.close();
+            true
+        } else {
+            false
+        }
+    }
+
     pub(super) fn poll_read_head(
         &mut self,
         cx: &mut Context<'_>,
@@ -221,20 +244,44 @@ where
         trace!("Conn::read_head");
 
         #[cfg(feature = "server")]
-        if !self.state.h1_header_read_timeout_running {
-            if let Some(h1_header_read_timeout) = self.state.h1_header_read_timeout {
+        if !self.state.h1_header_read_timeout.is_running {
+            if let Some(h1_header_read_timeout) = self.state.h1_header_read_timeout.timeout {
                 let deadline = self.state.timer.now() + h1_header_read_timeout;
-                self.state.h1_header_read_timeout_running = true;
-                match &mut self.state.h1_header_read_timeout_fut {
+                self.state.h1_header_read_timeout.is_running = true;
+                match &mut self.state.h1_header_read_timeout.deadline_fut {
                     Some(h1_header_read_timeout_fut) => {
                         trace!("resetting h1 header read timeout timer");
                         self.state.timer.reset(h1_header_read_timeout_fut, deadline);
                     }
                     None => {
                         trace!("setting h1 header read timeout timer");
-                        self.state.h1_header_read_timeout_fut =
+                        self.state.h1_header_read_timeout.deadline_fut =
                             Some(self.state.timer.sleep_until(deadline));
                     }
+                }
+            }
+        }
+
+        // If a graceful shutdown was requested, wait for the client to start
+        // sending its (last) request. If no bytes arrive within the configured
+        // grace period, the connection is closed as inactive instead.
+        //
+        // A grace period of zero doesn't need a timer: the read below is still
+        // attempted once, and the connection is closed if it would block.
+        #[cfg(feature = "server")]
+        if !self.state.h1_graceful_shutdown_first_byte_read_timeout.is_running {
+            if let Some(first_byte_read_timeout) = self
+                .state
+                .h1_graceful_shutdown_first_byte_read_timeout
+                .timeout
+            {
+                if !first_byte_read_timeout.is_zero() {
+                    trace!("setting graceful shutdown first byte timeout timer");
+                    let deadline = self.state.timer.now() + first_byte_read_timeout;
+                    let timeout_state =
+                        &mut self.state.h1_graceful_shutdown_first_byte_read_timeout;
+                    timeout_state.is_running = true;
+                    timeout_state.deadline_fut = Some(self.state.timer.sleep_until(deadline));
                 }
             }
         }
@@ -259,15 +306,47 @@ where
             Poll::Ready(Err(e)) => return self.on_read_head_error(e),
             Poll::Pending => {
                 #[cfg(feature = "server")]
-                if self.state.h1_header_read_timeout_running {
+                if self.state.h1_header_read_timeout.is_running {
                     if let Some(h1_header_read_timeout_fut) =
-                        &mut self.state.h1_header_read_timeout_fut
+                        &mut self.state.h1_header_read_timeout.deadline_fut
                     {
                         if Pin::new(h1_header_read_timeout_fut).poll(cx).is_ready() {
-                            self.state.h1_header_read_timeout_running = false;
+                            self.state.h1_header_read_timeout.is_running = false;
 
                             warn!("read header from client timeout");
                             return Poll::Ready(Some(Err(crate::Error::new_header_timeout())));
+                        }
+                    }
+                }
+
+                #[cfg(feature = "server")]
+                {
+                    let timeout_state = &mut self.state.h1_graceful_shutdown_first_byte_read_timeout;
+
+                    // The graceful shutdown grace period has elapsed. Close the
+                    // connection if the client still hasn't sent anything, so
+                    // that idle connections don't keep the server alive.
+                    if timeout_state.is_running {
+                        let mut elapsed = false;
+                        if let Some(fut) = timeout_state.deadline_fut.as_mut() {
+                            elapsed = Pin::new(fut).poll(cx).is_ready();
+                        }
+                        if elapsed {
+                            trace!("graceful shutdown first byte timeout");
+                            // The grace period is over; don't start it again.
+                            timeout_state.is_running = false;
+                            timeout_state.deadline_fut = None;
+                            timeout_state.timeout = None;
+                            if self.close_if_inactive() {
+                                return Poll::Ready(None);
+                            }
+                        }
+                    } else if timeout_state.timeout.is_some() {
+                        // A zero-length grace period, so the connection is
+                        // closed if no bytes have been received.
+                        trace!("graceful shutdown; no bytes received, closing");
+                        if self.close_if_inactive() {
+                            return Poll::Ready(None);
                         }
                     }
                 }
@@ -278,8 +357,13 @@ where
 
         #[cfg(feature = "server")]
         {
-            self.state.h1_header_read_timeout_running = false;
-            self.state.h1_header_read_timeout_fut = None;
+            self.state.h1_header_read_timeout.is_running = false;
+            self.state.h1_header_read_timeout.deadline_fut = None;
+
+            // The client started sending a request, so the grace period for
+            // the first byte no longer applies.
+            self.state.h1_graceful_shutdown_first_byte_read_timeout.is_running = false;
+            self.state.h1_graceful_shutdown_first_byte_read_timeout.deadline_fut = None;
         }
 
         // Note: don't deconstruct `msg` into local variables, it appears
@@ -901,13 +985,8 @@ where
 
     #[cfg(feature = "server")]
     pub(crate) fn disable_keep_alive(&mut self) {
-        if self.state.is_idle() {
-            trace!("disable_keep_alive; closing idle connection");
-            self.state.close();
-        } else {
-            trace!("disable_keep_alive; in-progress connection");
-            self.state.disable_keep_alive();
-        }
+        trace!("disable_keep_alive");
+        self.state.disable_keep_alive();
     }
 
     pub(crate) fn take_error(&mut self) -> crate::Result<()> {
@@ -954,11 +1033,11 @@ struct State {
     h1_max_headers: Option<usize>,
     h1_max_header_size: Option<usize>,
     #[cfg(feature = "server")]
-    h1_header_read_timeout: Option<Duration>,
+    h1_header_read_timeout: TimeoutState,
+    /// How long to wait for the client's first bytes once a graceful shutdown
+    /// has been requested.
     #[cfg(feature = "server")]
-    h1_header_read_timeout_fut: Option<Pin<Box<dyn Sleep>>>,
-    #[cfg(feature = "server")]
-    h1_header_read_timeout_running: bool,
+    h1_graceful_shutdown_first_byte_read_timeout: TimeoutState,
     #[cfg(feature = "server")]
     date_header: bool,
     #[cfg(feature = "server")]
@@ -1153,7 +1232,7 @@ impl State {
         }
 
         #[cfg(feature = "server")]
-        if self.h1_header_read_timeout.is_some() {
+        if self.h1_header_read_timeout.timeout.is_some() {
             // Next read will start and poll the header read timeout,
             // so we can close the connection if another header isn't
             // received in a timely manner.
@@ -1178,6 +1257,18 @@ impl State {
         self.upgrade = Some(tx);
         rx
     }
+}
+
+/// A configured timeout and its currently running timer, if any.
+#[cfg(feature = "server")]
+#[derive(Default)]
+struct TimeoutState {
+    /// The configured duration, if the timeout is enabled.
+    timeout: Option<Duration>,
+    /// The timer for the current deadline, once the timeout has been started.
+    deadline_fut: Option<Pin<Box<dyn Sleep>>>,
+    /// Whether the timer is currently running.
+    is_running: bool,
 }
 
 #[cfg(test)]
