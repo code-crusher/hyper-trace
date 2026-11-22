@@ -1693,6 +1693,83 @@ mod conn {
         future::join(server, client).await;
     }
 
+    // https://github.com/hyperium/hyper/issues/3588
+    //
+    // A pooled client connection that received an HTTP/1.0 (keep-alive)
+    // response from the server must not downgrade *subsequent* requests to
+    // HTTP/1.0: the response version describes only the message it came in,
+    // not what the peer accepts on the next round trip.
+    #[tokio::test]
+    async fn http_10_keep_alive_response_does_not_downgrade_next_request() {
+        use hyper::Version;
+
+        let (listener, addr) = setup_tk_test_server().await;
+
+        let server = async move {
+            let mut sock = listener.accept().await.unwrap().0;
+            let mut buf = [0; 4096];
+
+            // 1st request: a plain HTTP/1.1 GET.
+            let n = sock.read(&mut buf).await.expect("read 1");
+            assert_eq!(s(&buf[..n]), "GET /a HTTP/1.1\r\n\r\n");
+
+            // The server answers with HTTP/1.0, but keeps the connection alive.
+            sock.write_all(
+                b"HTTP/1.0 200 OK\r\nconnection: keep-alive\r\ncontent-length: 0\r\n\r\n",
+            )
+            .await
+            .unwrap();
+
+            // 2nd request on the same (reused) connection.
+            let n = sock.read(&mut buf).await.expect("read 2");
+            assert_eq!(
+                s(&buf[..n]),
+                "GET /b HTTP/1.1\r\n\r\n",
+                "a keep-alive HTTP/1.0 response must not downgrade the next request"
+            );
+
+            sock.write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\n\r\n")
+                .await
+                .unwrap();
+        };
+
+        let client = async move {
+            let tcp = tcp_connect(&addr).await.expect("connect");
+            let (mut client, conn) = conn::http1::handshake(tcp).await.expect("handshake");
+
+            tokio::task::spawn(async move {
+                conn.await.expect("http conn");
+            });
+
+            let req = Request::builder()
+                .method(Method::GET)
+                .uri("/a")
+                .version(Version::HTTP_11)
+                .body(Empty::<Bytes>::new())
+                .unwrap();
+            let mut res = client.send_request(req).await.expect("send_request 1");
+            assert_eq!(res.status(), hyper::StatusCode::OK);
+            assert_eq!(res.version(), Version::HTTP_10);
+            assert!(res.body_mut().frame().await.is_none());
+
+            // The connection is now reusable; before the fix, the HTTP/1.0
+            // response version had been recorded internally and this request
+            // would be sent as HTTP/1.0.
+            let req = Request::builder()
+                .method(Method::GET)
+                .uri("/b")
+                .version(Version::HTTP_11)
+                .body(Empty::<Bytes>::new())
+                .unwrap();
+            let mut res = client.send_request(req).await.expect("send_request 2");
+            assert_eq!(res.status(), hyper::StatusCode::OK);
+            assert_eq!(res.version(), Version::HTTP_11);
+            assert!(res.body_mut().frame().await.is_none());
+        };
+
+        future::join(server, client).await;
+    }
+
     #[tokio::test]
     async fn get_custom_reason_phrase() {
         let (listener, addr) = setup_tk_test_server().await;

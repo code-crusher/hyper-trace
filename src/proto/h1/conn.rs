@@ -81,7 +81,8 @@ where
                 writing: Writing::Init,
                 upgrade: None,
                 // We assume a modern world where the remote speaks HTTP/1.1.
-                // If they tell us otherwise, we'll downgrade in `read_head`.
+                // If a server's incoming requests tell us otherwise, we'll
+                // downgrade in `read_head`.
                 version: Version::HTTP_11,
                 allow_trailer_fields: false,
             },
@@ -298,7 +299,16 @@ where
 
         self.state.busy();
         self.state.keep_alive &= msg.keep_alive;
-        self.state.version = msg.head.version;
+        // Only a server learns the remote's version from incoming messages:
+        // there they are requests, and an HTTP/1.0 request means the peer
+        // cannot speak HTTP/1.1, so responses must be downgraded. On a client,
+        // the incoming message is a response, whose version describes that one
+        // message alone: a server that answers HTTP/1.0 while keeping the
+        // connection alive has just parsed our HTTP/1.1 request, and must not
+        // cause the requests that follow to be downgraded to HTTP/1.0.
+        if T::is_server() {
+            self.state.version = msg.head.version;
+        }
 
         let mut wants = if msg.wants_upgrade {
             Wants::UPGRADE
@@ -982,7 +992,12 @@ struct State {
     writing: Writing,
     /// An expected pending HTTP upgrade.
     upgrade: Option<crate::upgrade::Pending>,
-    /// Either HTTP/1.0 or 1.1 connection.
+    /// The version the peer is known to speak, used to adapt outgoing
+    /// messages.
+    ///
+    /// Only updated from incoming *requests* (i.e. on server connections):
+    /// their version tells us what the peer understands. A response version
+    /// describes only that one message, so it must not be recorded here.
     version: Version,
     /// Flag to track if trailer fields are allowed to be sent.
     allow_trailer_fields: bool,
@@ -1282,6 +1297,51 @@ mod tests {
             !remains_reusable_after_get(&["keep-alive", "close"]),
             "a `close` in any Connection header line must disable keep-alive"
         );
+    }
+
+    // An incoming response version describes that one message only: a server
+    // that answers HTTP/1.0 while keeping the connection alive has just parsed
+    // an HTTP/1.1 request, so the connection must not remember HTTP/1.0 and
+    // downgrade the requests that follow.
+    //
+    // https://github.com/hyperium/hyper/issues/3588
+    #[cfg(feature = "client")]
+    #[test]
+    fn client_http_10_response_does_not_stick_as_connection_version() {
+        let io = tokio_test::io::Builder::new()
+            .read(b"HTTP/1.0 200 OK\r\nconnection: keep-alive\r\ncontent-length: 0\r\n\r\n")
+            .build();
+        let mut conn = Conn::<_, Bytes, ClientTransaction>::new(Compat::new(io));
+
+        // The client is busy writing a request, so reading the response head is
+        // allowed.
+        conn.state.busy();
+        conn.state.writing = Writing::KeepAlive;
+        let (head, ..) = ready(poll_head(&mut conn))
+            .expect("response")
+            .expect("valid response");
+        // The *message* keeps the version it arrived with...
+        assert_eq!(head.version, Version::HTTP_10);
+        // ...but the connection must not adopt it for future requests.
+        assert_eq!(conn.state.version, Version::HTTP_11);
+    }
+
+    // On a server connection the incoming message is a *request*, so its
+    // version legitimately describes what the peer speaks. It must still be
+    // remembered so a HTTP/1.0-only peer gets HTTP/1.0 responses.
+    #[cfg(feature = "server")]
+    #[test]
+    fn server_http_10_request_sticks_as_connection_version() {
+        let io = tokio_test::io::Builder::new()
+            .read(b"GET / HTTP/1.0\r\n\r\n")
+            .build();
+        let mut conn = Conn::<_, Bytes, ServerTransaction>::new(Compat::new(io));
+
+        let (head, ..) = ready(poll_head(&mut conn))
+            .expect("request")
+            .expect("valid request");
+        assert_eq!(head.version, Version::HTTP_10);
+        assert_eq!(conn.state.version, Version::HTTP_10);
     }
 
     use super::*;
