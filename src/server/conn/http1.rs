@@ -83,6 +83,7 @@ pub struct Builder {
     max_buf_size: Option<usize>,
     pipeline_flush: bool,
     date_header: bool,
+    graceful_shutdown_during_idle: bool,
 }
 
 /// Deconstructed parts of a `Connection`.
@@ -130,6 +131,11 @@ where
     ///
     /// This `Connection` should continue to be polled until shutdown
     /// can finish.
+    ///
+    /// If the connection is idle, it is closed immediately, unless
+    /// [`Builder::graceful_shutdown_during_idle`] was enabled, in which case
+    /// it stays open and serves one more request with `connection: close`
+    /// before closing.
     ///
     /// # Note
     ///
@@ -255,6 +261,7 @@ impl Builder {
             max_buf_size: None,
             pipeline_flush: false,
             date_header: true,
+            graceful_shutdown_during_idle: false,
         }
     }
     /// Set whether HTTP/1 connections should support half-closures.
@@ -275,6 +282,34 @@ impl Builder {
     /// Default is `true`.
     pub fn keep_alive(&mut self, val: bool) -> &mut Self {
         self.h1_keep_alive = val;
+        self
+    }
+
+    /// Set whether a graceful shutdown lets the connection serve one more request.
+    ///
+    /// Normally, calling [`Connection::graceful_shutdown`] on an idle connection
+    /// closes it immediately. When this is enabled, an idle connection instead
+    /// stays open and keeps reading requests. Each response is sent with
+    /// `connection: close`, and the connection is closed once a request has been
+    /// served (or the client closes it).
+    ///
+    /// This is useful for a load balancer draining a server: the server can start
+    /// telling clients to go away (via `connection: close`) while it keeps
+    /// accepting requests until the load balancer has de-registered it.
+    ///
+    /// Default is `false`.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// # use hyper::server::conn::http1::Builder;
+    /// # fn main() {
+    /// let mut http = Builder::new();
+    /// http.graceful_shutdown_during_idle(true);
+    /// # }
+    /// ```
+    pub fn graceful_shutdown_during_idle(&mut self, val: bool) -> &mut Self {
+        self.graceful_shutdown_during_idle = val;
         self
     }
 
@@ -478,6 +513,9 @@ impl Builder {
         let mut conn = proto::Conn::new(io);
         conn.set_h1_parser_config(self.h1_parser_config.clone());
         conn.set_timer(self.timer.clone());
+        if self.graceful_shutdown_during_idle {
+            conn.set_graceful_shutdown_during_idle();
+        }
         if !self.h1_keep_alive {
             conn.disable_keep_alive();
         }

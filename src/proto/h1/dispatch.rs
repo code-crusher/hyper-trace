@@ -99,7 +99,14 @@ where
         // If keep alive has been disabled and no read or write has been seen on
         // the connection yet, we must be in a state where the server is being asked to
         // shut down before any data has been seen on the connection
-        if self.conn.is_write_closed() || self.conn.has_initial_read_write_state() {
+        //
+        // In "graceful shutdown during idle" mode, the connection instead stays
+        // open so it can answer a request that arrives after the shutdown
+        // started.
+        if self.conn.is_write_closed()
+            || (self.conn.has_initial_read_write_state()
+                && !self.conn.is_graceful_shutdown_during_idle())
+        {
             self.close();
         }
     }

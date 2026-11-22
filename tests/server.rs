@@ -1306,6 +1306,202 @@ async fn disable_keep_alive_post_request() {
 }
 
 #[tokio::test]
+async fn graceful_shutdown_during_idle_serves_request_after_shutdown() {
+    let (client_io, server_io, _) = setup_duplex_test_server();
+
+    let conn = http1::Builder::new()
+        .graceful_shutdown_during_idle(true)
+        .serve_connection(TokioIo::new(server_io), HelloWorld);
+    pin!(conn);
+
+    // Shut down while the connection is still idle, before the client has sent
+    // anything at all.
+    conn.as_mut().graceful_shutdown();
+
+    let client_task = tokio::spawn(async move {
+        let mut client_io = client_io;
+        client_io
+            .write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            .await
+            .unwrap();
+
+        // The request must still be served, even though the shutdown already
+        // started. The response tells the client to go away.
+        let mut buf = vec![];
+        client_io.read_to_end(&mut buf).await.unwrap();
+        buf
+    });
+
+    let (buf, served) =
+        future::join(client_task, future::poll_fn(|cx| conn.as_mut().poll(cx))).await;
+    served.expect("connection should end without error");
+    let buf = buf.unwrap();
+    let sbuf = s(&buf);
+    assert!(
+        sbuf.starts_with("HTTP/1.1 200 OK\r\n"),
+        "should serve the request, but buf: {:?}",
+        sbuf,
+    );
+    assert!(
+        sbuf.contains("connection: close\r\n"),
+        "response should have sent close: {:?}",
+        sbuf,
+    );
+}
+
+#[tokio::test]
+async fn graceful_shutdown_during_idle_serves_one_request_then_closes() {
+    let (client_io, server_io, _) = setup_duplex_test_server();
+
+    let conn = http1::Builder::new()
+        .graceful_shutdown_during_idle(true)
+        .serve_connection(TokioIo::new(server_io), HelloWorld);
+    pin!(conn);
+
+    conn.as_mut().graceful_shutdown();
+
+    let client_task = tokio::spawn(async move {
+        let mut client_io = client_io;
+        // A single pipelined write of two requests: only the first should be
+        // answered, since the connection is closing.
+        client_io
+            .write_all(
+                b"\
+                GET / HTTP/1.1\r\nHost: localhost\r\n\r\n\
+                GET / HTTP/1.1\r\nHost: localhost\r\n\r\n\
+            ",
+            )
+            .await
+            .unwrap();
+
+        let mut buf = vec![];
+        client_io.read_to_end(&mut buf).await.unwrap();
+        buf
+    });
+
+    let (buf, served) =
+        future::join(client_task, future::poll_fn(|cx| conn.as_mut().poll(cx))).await;
+    served.expect("connection should end without error");
+    let buf = buf.unwrap();
+    let sbuf = s(&buf);
+    assert!(
+        sbuf.starts_with("HTTP/1.1 200 OK\r\n"),
+        "should serve the first request, but buf: {:?}",
+        sbuf,
+    );
+    assert!(
+        sbuf.contains("connection: close\r\n"),
+        "response should have sent close: {:?}",
+        sbuf,
+    );
+    assert_eq!(
+        sbuf.matches("HTTP/1.1 200 OK\r\n").count(),
+        1,
+        "should only serve one request, buf: {:?}",
+        sbuf,
+    );
+}
+
+#[tokio::test]
+async fn graceful_shutdown_during_idle_serves_partial_request() {
+    let (client_io, server_io, _) = setup_duplex_test_server();
+    let (tx1, rx1) = oneshot::channel();
+    let (tx2, rx2) = oneshot::channel();
+
+    let client_task = tokio::spawn(async move {
+        let mut client_io = client_io;
+        // Send a partial request, and let the server start reading it.
+        client_io.write_all(b"GET / HTTP/1.1\r\n").await.unwrap();
+        tx1.send(()).unwrap();
+        rx2.await.unwrap();
+        client_io
+            .write_all(b"Host: localhost\r\n\r\n")
+            .await
+            .unwrap();
+        let mut buf = vec![];
+        client_io.read_to_end(&mut buf).await.unwrap();
+        buf
+    });
+
+    let srv = http1::Builder::new()
+        .graceful_shutdown_during_idle(true)
+        .serve_connection(TokioIo::new(server_io), HelloWorld);
+    let mut conn = match future::try_select(srv, rx1).await {
+        Ok(Either::Left(_)) => panic!("expected rx first"),
+        Ok(Either::Right(((), conn))) => conn,
+        Err(_) => panic!("unexpected error"),
+    };
+    // The request is partially read; start the shutdown now.
+    Pin::new(&mut conn).graceful_shutdown();
+    tx2.send(()).unwrap();
+
+    let served = future::poll_fn(|cx| Pin::new(&mut conn).poll(cx));
+
+    let (buf, served) = future::join(client_task, served).await;
+    served.expect("connection should end without error");
+    let buf = buf.unwrap();
+    let sbuf = s(&buf);
+    assert!(
+        sbuf.starts_with("HTTP/1.1 200 OK\r\n"),
+        "should serve the partial request, but buf: {:?}",
+        sbuf,
+    );
+    assert!(
+        sbuf.contains("connection: close\r\n"),
+        "response should have sent close: {:?}",
+        sbuf,
+    );
+}
+
+#[tokio::test]
+async fn graceful_shutdown_during_idle_closes_when_client_eofs() {
+    let (client_io, server_io, _) = setup_duplex_test_server();
+
+    let conn = http1::Builder::new()
+        .graceful_shutdown_during_idle(true)
+        .serve_connection(TokioIo::new(server_io), HelloWorld);
+    pin!(conn);
+
+    conn.as_mut().graceful_shutdown();
+
+    // Dropping the client's side closes it, so the server should notice EOF
+    // and finish instead of waiting forever.
+    drop(client_io);
+
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        future::poll_fn(|cx| conn.as_mut().poll(cx)),
+    )
+    .await
+    .expect("timed out waiting for connection to close")
+    .expect("connection should end without error");
+}
+
+#[tokio::test]
+async fn graceful_shutdown_during_idle_disabled_closes_idle_connection() {
+    let (client_io, server_io, _) = setup_duplex_test_server();
+
+    // The default behavior is unchanged: an idle connection is closed as soon
+    // as the graceful shutdown starts.
+    let conn = http1::Builder::new().serve_connection(TokioIo::new(server_io), HelloWorld);
+    pin!(conn);
+
+    conn.as_mut().graceful_shutdown();
+
+    let mut client_io = client_io;
+    let mut buf = vec![];
+    let read_to_end = client_io.read_to_end(&mut buf);
+    let served = future::poll_fn(|cx| conn.as_mut().poll(cx));
+    let (read, served) =
+        tokio::time::timeout(Duration::from_secs(5), future::join(read_to_end, served))
+            .await
+            .expect("timed out waiting for the server to close");
+    read.expect("read");
+    served.expect("connection should end without error");
+    assert!(buf.is_empty(), "no response should be sent: {:?}", buf);
+}
+
+#[tokio::test]
 async fn http1_graceful_shutdown_after_upgrade() {
     let (listener, addr) = setup_tcp_listener();
     let (read_101_tx, read_101_rx) = oneshot::channel();

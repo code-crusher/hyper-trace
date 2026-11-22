@@ -66,6 +66,8 @@ where
                 #[cfg(feature = "server")]
                 h1_header_read_timeout_running: false,
                 #[cfg(feature = "server")]
+                graceful_shutdown_during_idle: false,
+                #[cfg(feature = "server")]
                 date_header: true,
                 #[cfg(feature = "server")]
                 timer: Time::Empty,
@@ -161,6 +163,11 @@ where
         self.state.date_header = false;
     }
 
+    #[cfg(feature = "server")]
+    pub(crate) fn set_graceful_shutdown_during_idle(&mut self) {
+        self.state.graceful_shutdown_during_idle = true;
+    }
+
     pub(crate) fn into_inner(self) -> (I, Bytes) {
         self.io.into_inner()
     }
@@ -201,6 +208,11 @@ where
         matches!(self.state.reading, Reading::Init)
             && matches!(self.state.writing, Writing::Init)
             && self.io.read_buf().is_empty()
+    }
+
+    #[cfg(feature = "server")]
+    pub(crate) fn is_graceful_shutdown_during_idle(&self) -> bool {
+        self.state.graceful_shutdown_during_idle
     }
 
     fn should_error_on_eof(&self) -> bool {
@@ -901,7 +913,7 @@ where
 
     #[cfg(feature = "server")]
     pub(crate) fn disable_keep_alive(&mut self) {
-        if self.state.is_idle() {
+        if self.state.is_idle() && !self.state.graceful_shutdown_during_idle {
             trace!("disable_keep_alive; closing idle connection");
             self.state.close();
         } else {
@@ -959,6 +971,12 @@ struct State {
     h1_header_read_timeout_fut: Option<Pin<Box<dyn Sleep>>>,
     #[cfg(feature = "server")]
     h1_header_read_timeout_running: bool,
+    /// Whether an idle connection should be kept open when keep-alive is
+    /// disabled, so that a pending request can still be answered.
+    ///
+    /// See [`Builder::graceful_shutdown_during_idle`][crate::server::conn::http1::Builder::graceful_shutdown_during_idle].
+    #[cfg(feature = "server")]
+    graceful_shutdown_during_idle: bool,
     #[cfg(feature = "server")]
     date_header: bool,
     #[cfg(feature = "server")]
@@ -1452,5 +1470,68 @@ mod tests {
         tokio_test::task::spawn(()).enter(|cx, _| {
             assert!(conn.poll_flush(cx).is_ready());
         });
+    }
+
+    #[cfg(feature = "server")]
+    #[test]
+    fn disable_keep_alive_closes_idle_conn() {
+        let io = tokio_test::io::Builder::new().build();
+        let mut conn = Conn::<_, Bytes, ServerTransaction>::new(Compat::new(io));
+        conn.state.idle::<ServerTransaction>();
+        conn.disable_keep_alive();
+        assert!(conn.is_read_closed());
+        assert!(conn.is_write_closed());
+    }
+
+    #[cfg(feature = "server")]
+    #[test]
+    fn disable_keep_alive_during_idle_keeps_idle_conn_open() {
+        let io = tokio_test::io::Builder::new().build();
+        let mut conn = Conn::<_, Bytes, ServerTransaction>::new(Compat::new(io));
+        conn.state.idle::<ServerTransaction>();
+        conn.set_graceful_shutdown_during_idle();
+        conn.disable_keep_alive();
+        // The connection is still open, so it can serve a request that
+        // arrives after the shutdown started.
+        assert!(!conn.is_read_closed());
+        assert!(!conn.is_write_closed());
+        assert!(conn.can_read_head());
+    }
+
+    #[cfg(feature = "server")]
+    #[test]
+    fn disable_keep_alive_during_idle_serves_pending_request() {
+        let io = tokio_test::io::Builder::new()
+            .read(b"GET / HTTP/1.1\r\n\r\n")
+            .write(b"HTTP/1.1 200 OK\r\nconnection: close\r\ncontent-length: 0\r\n\r\n")
+            .build();
+        let mut conn = Conn::<_, Bytes, ServerTransaction>::new(Compat::new(io));
+        conn.state.idle::<ServerTransaction>();
+        conn.set_graceful_shutdown_during_idle();
+        conn.disable_date_header();
+        conn.disable_keep_alive();
+
+        // The request that arrived after the shutdown started is still read.
+        let (head, body, _) = ready(poll_head(&mut conn))
+            .expect("request")
+            .expect("valid request");
+        assert_eq!(body, DecodedLength::ZERO);
+
+        // And it is answered with `connection: close`, after which the
+        // connection closes instead of waiting for another request.
+        conn.write_head(
+            MessageHead {
+                version: Version::HTTP_11,
+                subject: http::StatusCode::OK,
+                headers: HeaderMap::new(),
+                extensions: http::Extensions::new(),
+            },
+            Some(BodyLength::Known(0)),
+        );
+        tokio_test::task::spawn(()).enter(|cx, _| {
+            assert!(conn.poll_flush(cx).is_ready());
+        });
+        assert!(conn.is_write_closed());
+        assert_eq!(head.subject.0, Method::GET);
     }
 }
