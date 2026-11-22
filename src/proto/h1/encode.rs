@@ -14,6 +14,7 @@ use http::{
 
 use super::io::WriteBuf;
 use super::role::{write_headers, write_headers_title_case};
+use crate::common::buf::{chunks_vectored_from_chunk, VectoredBuf};
 
 type StaticBuf = &'static [u8];
 
@@ -321,17 +322,51 @@ where
             BufKind::Trailers(b) => b.advance(cnt),
         }
     }
+}
 
+impl<B: Buf> VectoredBuf for EncodedBuf<B> {
     #[inline]
-    fn chunks_vectored<'data>(&'data self, dst: &mut [IoSlice<'data>]) -> usize {
+    fn chunks_vectored_prefix<'data>(&'data self, dst: &mut [IoSlice<'data>]) -> (usize, bool) {
         match &self.kind {
-            BufKind::Exact(b) => b.chunks_vectored(dst),
-            BufKind::Limited(b) => b.chunks_vectored(dst),
-            BufKind::Chunked(b) => b.chunks_vectored(dst),
-            BufKind::ChunkedEnd(b) => b.chunks_vectored(dst),
-            BufKind::Trailers(b) => b.chunks_vectored(dst),
+            BufKind::Exact(b) => chunks_vectored_from_chunk(b, dst),
+            BufKind::Limited(b) => chunks_vectored_from_chunk(b, dst),
+            BufKind::Chunked(b) => {
+                let mut vecs = 0;
+                if !append_chunk(b.first_ref().first_ref(), dst, &mut vecs) {
+                    return (vecs, false);
+                }
+                if !append_chunk(b.first_ref().last_ref(), dst, &mut vecs) {
+                    return (vecs, false);
+                }
+                let complete = append_chunk(b.last_ref(), dst, &mut vecs);
+                (vecs, complete)
+            }
+            BufKind::ChunkedEnd(b) => chunks_vectored_from_chunk(b, dst),
+            BufKind::Trailers(b) => {
+                let mut vecs = 0;
+                if !append_chunk(b.first_ref().first_ref(), dst, &mut vecs) {
+                    return (vecs, false);
+                }
+                if !append_chunk(b.first_ref().last_ref(), dst, &mut vecs) {
+                    return (vecs, false);
+                }
+                let complete = append_chunk(b.last_ref(), dst, &mut vecs);
+                (vecs, complete)
+            }
         }
     }
+}
+
+/// Append one contiguous slice of `buf`, returning whether it covered all of
+/// `buf`'s remaining bytes.
+#[inline]
+fn append_chunk<'data, B>(buf: &'data B, dst: &mut [IoSlice<'data>], vecs: &mut usize) -> bool
+where
+    B: Buf + ?Sized,
+{
+    let (n, complete) = chunks_vectored_from_chunk(buf, &mut dst[*vecs..]);
+    *vecs += n;
+    complete
 }
 
 const USIZE_BYTES: usize = std::mem::size_of::<usize>();
@@ -434,7 +469,10 @@ impl std::error::Error for NotEof {}
 
 #[cfg(test)]
 mod tests {
-    use bytes::BufMut;
+    use std::io::IoSlice;
+
+    use bytes::{Buf, BufMut, Bytes};
+
     use http::{
         header::{
             AUTHORIZATION, CACHE_CONTROL, CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_RANGE,
@@ -445,6 +483,7 @@ mod tests {
 
     use super::super::io::Cursor;
     use super::Encoder;
+    use crate::common::buf::VectoredBuf;
 
     #[test]
     fn chunked() {
@@ -699,5 +738,77 @@ mod tests {
         let mut dst = Vec::new();
         dst.put(buf);
         assert_eq!(dst, b"0\r\nchunky-trailer: trailer value\r\n\r\n");
+    }
+
+    /// A `Buf` whose `chunk()` only ever exposes a single byte, like the one
+    /// in issue #3650. Its default `chunks_vectored` therefore reports one
+    /// byte at a time, while `remaining()` stays much larger.
+    struct OneByteAtATime {
+        data: Vec<u8>,
+        pos: usize,
+    }
+
+    impl Buf for OneByteAtATime {
+        fn remaining(&self) -> usize {
+            self.data.len() - self.pos
+        }
+
+        fn chunk(&self) -> &[u8] {
+            let end = std::cmp::min(self.pos + 1, self.data.len());
+            &self.data[self.pos..end]
+        }
+
+        fn advance(&mut self, cnt: usize) {
+            self.pos += cnt;
+        }
+    }
+
+    /// Drain `buf` the way the vectored write path would: gather a prefix of
+    /// slices, then advance over the bytes they cover.
+    fn drain_vectored(mut buf: impl VectoredBuf) -> Vec<u8> {
+        let mut out = Vec::new();
+        while buf.has_remaining() {
+            let mut iovs = [IoSlice::new(&[]); 8];
+            let (n, _) = buf.chunks_vectored_prefix(&mut iovs);
+            assert!(n > 0, "no vectored chunks returned while bytes remain");
+            let mut wrote = 0;
+            for iov in &iovs[..n] {
+                out.extend_from_slice(iov);
+                wrote += iov.len();
+            }
+            buf.advance(wrote);
+        }
+        out
+    }
+
+    /// A body `Buf` that exposes a partial prefix first and more bytes after,
+    /// so any composition of vectored slices must stop at its first chunk.
+    fn nested_partial_body() -> impl Buf {
+        OneByteAtATime {
+            data: b"abc".to_vec(),
+            pos: 0,
+        }
+        .chain(Bytes::from_static(b"xyz"))
+    }
+
+    #[test]
+    fn chunked_vectored_nested_partial_chunk() {
+        let mut encoder = Encoder::chunked();
+        let buf = encoder.encode(nested_partial_body());
+        assert_eq!(drain_vectored(buf), b"6\r\nabcxyz\r\n");
+    }
+
+    #[test]
+    fn exact_vectored_nested_partial_chunk() {
+        let mut encoder = Encoder::length(6);
+        let buf = encoder.encode(nested_partial_body());
+        assert_eq!(drain_vectored(buf), b"abcxyz");
+    }
+
+    #[test]
+    fn limited_vectored_nested_partial_chunk() {
+        let mut encoder = Encoder::length(4);
+        let buf = encoder.encode(nested_partial_body());
+        assert_eq!(drain_vectored(buf), b"abcx");
     }
 }

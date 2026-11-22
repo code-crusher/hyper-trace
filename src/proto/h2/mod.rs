@@ -1,6 +1,6 @@
 use std::error::Error as StdError;
 use std::future::Future;
-use std::io::{Cursor, IoSlice};
+use std::io::Cursor;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
@@ -319,11 +319,85 @@ impl<B: Buf> Buf for SendBuf<B> {
         }
     }
 
-    fn chunks_vectored<'data>(&'data self, dst: &mut [IoSlice<'data>]) -> usize {
-        match self {
-            Self::Buf(b) => b.chunks_vectored(dst),
-            Self::Cursor(c) => c.chunks_vectored(dst),
-            Self::None => 0,
+    // Intentionally keep `Buf`'s default single-chunk `chunks_vectored` rather
+    // than forwarding to `B`. The h2 codec chains this buffer with frame
+    // headers and its own framing buffer, and `B::chunks_vectored` may expose
+    // a non-contiguous view when `B::chunk()` only returns a partial prefix
+    // (allowed by the `Buf` contract). Hyper cannot verify that a custom
+    // `chunks_vectored` returns a prefix, so only the one slice `chunk()`
+    // guarantees is exposed.
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::IoSlice;
+
+    use bytes::{Buf, Bytes};
+
+    use super::SendBuf;
+
+    struct OneByteAtATime {
+        data: &'static [u8],
+        pos: usize,
+    }
+
+    impl Buf for OneByteAtATime {
+        fn remaining(&self) -> usize {
+            self.data.len() - self.pos
         }
+
+        fn chunk(&self) -> &[u8] {
+            let end = std::cmp::min(self.pos + 1, self.data.len());
+            &self.data[self.pos..end]
+        }
+
+        fn advance(&mut self, cnt: usize) {
+            self.pos += cnt;
+        }
+    }
+
+    /// Drain `buf` the way h2's codec does: gather vectored slices, then
+    /// advance over the bytes they cover.
+    fn drain_vectored(mut buf: impl Buf) -> Vec<u8> {
+        let mut out = Vec::new();
+        while buf.has_remaining() {
+            let mut iovs = [IoSlice::new(&[]); 8];
+            let n = buf.chunks_vectored(&mut iovs);
+            assert!(n > 0, "chunks_vectored returned 0 while bytes remain");
+            let mut wrote = 0;
+            for iov in &iovs[..n] {
+                out.extend_from_slice(iov);
+                wrote += iov.len();
+            }
+            buf.advance(wrote);
+        }
+        out
+    }
+
+    // Regression test for issue #3650: a body `Buf` exposing a partial
+    // prefix must never let bytes after the gap reach the codec.
+    #[test]
+    fn send_buf_vectored_is_contiguous_prefix() {
+        let body = OneByteAtATime {
+            data: b"abc",
+            pos: 0,
+        }
+        .chain(Bytes::from_static(b"XYZ"));
+        assert_eq!(drain_vectored(SendBuf::Buf(body)), b"abcXYZ");
+    }
+
+    // The common case keeps its batching: `Bytes` payloads stay gathered with
+    // h2's frame header in a single writev.
+    #[test]
+    fn send_buf_bytes_stays_vectored_with_framing() {
+        let buf =
+            Bytes::from_static(b"frame header").chain(SendBuf::Buf(Bytes::from_static(b"hello")));
+        let mut iovs = [IoSlice::new(&[]); 2];
+
+        let n = buf.chunks_vectored(&mut iovs);
+
+        assert_eq!(n, 2);
+        assert_eq!(&*iovs[0], b"frame header");
+        assert_eq!(&*iovs[1], b"hello");
     }
 }
